@@ -75,7 +75,7 @@ class BaseStrategy(bt.Strategy):
             self.log(
                 f"{side}成交: price={order.executed.price:.2f}, "
                 f"size={abs(order.executed.size)}, "
-                f"value={abs(order.executed.value):.2f}, "
+                f"value={abs(order.executed.size * order.executed.price):.2f}, "
                 f"commission={order.executed.comm:.2f}, "
                 f"cash={self.broker.getcash():.2f}, "
                 f"account_value={self.broker.getvalue():.2f}"
@@ -86,7 +86,9 @@ class BaseStrategy(bt.Strategy):
                     "side": side,
                     "price": round(order.executed.price, 4),
                     "size": abs(order.executed.size),
-                    "value": round(abs(order.executed.value), 4),
+                    # 卖出时 Backtrader 的 order.executed.value 不是本笔卖出成交额，
+                    # 这里统一按 成交价 × 成交数量 记录，避免卖出金额显示成买入成本。
+                    "value": round(abs(order.executed.size * order.executed.price), 4),
                     "commission": round(order.executed.comm, 4),
                     "cash": round(self.broker.getcash(), 4),
                     "accountValue": round(self.broker.getvalue(), 4),

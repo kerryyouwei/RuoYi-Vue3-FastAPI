@@ -319,6 +319,23 @@ class StockStrategyService:
             ).info('股票策略回测行情数据加载完成')
             cerebro = bt.Cerebro()
             cerebro.adddata(bt.feeds.PandasData(dataname=data), name=run.code)
+
+            # 组合策略可以通过 UNIVERSE 声明多个标的；主时钟标的本身不要重复加入。
+            universe = [
+                code for code in (getattr(strategy_cls, 'UNIVERSE', None) or [])
+                if code != run.code
+            ]
+            for universe_code in universe:
+                universe_data = cls._load_stock_data(universe_code, data_start_date, run.end_date)
+                if universe_data is None:
+                    logger.bind(run_id=run.run_id, universe_code=universe_code).warning('组合策略标的未加载到数据，已跳过')
+                    continue
+                cerebro.adddata(
+                    bt.feeds.PandasData(dataname=universe_data),
+                    name=universe_code,
+                )
+            logger.bind(run_id=run.run_id, feeds=len(cerebro.datas)).info('组合策略行情数据加载完成')
+
             cerebro.addstrategy(
                 cls._live_start_strategy(strategy_cls, signal_start_date),
                 **strategy_params,
@@ -434,14 +451,17 @@ class StockStrategyService:
         return {'summary': summary, 'curves': curves, 'trades': trades, 'run_logs': logs.getvalue().splitlines()}
 
     @staticmethod
-    def _load_stock_data(code: str, start: str, end: str):
+    def _load_qa_daily_data(code: str, start: str, end: str, index: bool = False):
         try:
             import pandas as pd
             import QUANTAXIS as QA
         except ImportError as exc:
             raise RuntimeError('缺少 QUANTAXIS 或 pandas，无法加载行情数据') from exc
 
-        stock_data = QA.QA_fetch_stock_day_adv(code, start, end)
+        fetcher = getattr(QA, 'QA_fetch_index_day_adv' if index else 'QA_fetch_stock_day_adv', None)
+        if fetcher is None:
+            return None
+        stock_data = fetcher(code, start, end)
         if stock_data is None or stock_data.data.empty:
             return None
         data = stock_data.data.reset_index().copy()
@@ -452,6 +472,22 @@ class StockStrategyService:
         data = data.dropna(subset=columns)
         return data[columns].sort_index() if not data.empty else None
 
+    @staticmethod
+    def _load_tencent_etf_data(code: str, start: str, end: str):
+        from youw_test.strategies.etf_data import fetch_etf_daily
+
+        return fetch_etf_daily(code, start, end)
+
+    @classmethod
+    def _load_stock_data(cls, code: str, start: str, end: str):
+        """兼容股票、指数和腾讯ETF前复权日线的统一入口。"""
+        data = cls._load_qa_daily_data(code, start, end, index=False)
+        if data is not None:
+            return data
+        data = cls._load_qa_daily_data(code, start, end, index=True)
+        if data is not None:
+            return data
+        return cls._load_tencent_etf_data(code, start, end)
     @staticmethod
     def _finite(value: Any) -> float | None:
         if value is None:

@@ -1,0 +1,12 @@
+{
+  "_说明": "code=ETF代码, name=名称, buy_price=买入均价, shares=持有份额, buy_date=买入日期。填写后保存并重新运行本脚本。",
+  "positions": [
+    {
+      "code": "512760",
+      "name": "芯片ETF",
+      "buy_price": 1.02,
+      "shares": 9300,
+      "buy_date": "2026-01-05"
+    }
+  ]
+}
