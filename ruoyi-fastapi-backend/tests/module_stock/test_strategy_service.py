@@ -82,6 +82,7 @@ def test_run_detail_contains_replay_parameters() -> None:
         end_date='2024-02-01',
         initial_cash=100000,
         commission_rate='0.0003',
+        stamp_tax_rate='0.001',
         benchmark_code=None,
         strategy_params={'short_period': 5},
         status='success',
@@ -107,3 +108,4 @@ def test_non_finite_metrics_are_not_persisted() -> None:
     assert StockStrategyService._finite(float('nan')) is None
     assert StockStrategyService._finite(float('inf')) is None
     assert StockStrategyService._finite(1.25) == 1.25
+

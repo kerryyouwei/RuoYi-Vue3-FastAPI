@@ -18,6 +18,7 @@ except ImportError as exc:
 
 from youw_test.strategies import load_strategy
 
+
 STRATEGY_NAME = "ma"  # 可选: ma、macd、turtle、rsi、my_strategy
 STRATEGY_PARAMS = {"trade_size": 1000}
 
@@ -78,4 +79,3 @@ def run_backtest():
 
 if __name__ == "__main__":
     run_backtest()
-

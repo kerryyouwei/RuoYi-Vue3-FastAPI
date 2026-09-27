@@ -2,7 +2,6 @@
 
 import backtrader as bt
 
-
 class BaseStrategy(bt.Strategy):
     params = (
         ("trade_size", 1000),
@@ -83,6 +82,7 @@ class BaseStrategy(bt.Strategy):
             self.execution_records.append(
                 {
                     "date": self.datas[0].datetime.date(0).isoformat(),
+                    "code": order.data._name,
                     "side": side,
                     "price": round(order.executed.price, 4),
                     "size": abs(order.executed.size),
