@@ -1,5 +1,36 @@
 SET TIME ZONE 'UTC';
 
+
+-- ----------------------------
+-- 股票策略回测记录表
+-- ----------------------------
+drop table if exists stock_strategy_run;
+create table stock_strategy_run (
+    run_id varchar(36) primary key,
+    strategy_name varchar(64) not null,
+    code varchar(6) not null,
+    start_date varchar(10) not null,
+    end_date varchar(10) not null,
+    initial_cash bigint not null,
+    commission_rate varchar(32) not null,
+    stamp_tax_rate varchar(32) not null default '0.001',
+    benchmark_code varchar(6),
+    strategy_params json not null,
+    status varchar(16) not null default 'pending',
+    progress bigint not null default 0,
+    error_message text,
+    summary json,
+    curves json,
+    trades json,
+    run_logs json,
+    create_time timestamp(3) with time zone,
+    update_time timestamp(3) with time zone
+);
+create index ix_stock_strategy_run_name on stock_strategy_run(strategy_name);
+create index ix_stock_strategy_run_status on stock_strategy_run(status);
+comment on table stock_strategy_run is '股票策略回测记录表';
+
+
 -- ----------------------------
 -- 1、部门表
 -- ----------------------------
@@ -363,6 +394,12 @@ insert into sys_menu values(1057, '生成删除', 116, '3', '#', '', '', '', 1, 
 insert into sys_menu values(1058, '导入代码', 116, '4', '#', '', '', '', 1, 0, 'F', '0', '0', 'tool:gen:import',            '#', 'admin', current_timestamp, '', null, '');
 insert into sys_menu values(1059, '预览代码', 116, '5', '#', '', '', '', 1, 0, 'F', '0', '0', 'tool:gen:preview',           '#', 'admin', current_timestamp, '', null, '');
 insert into sys_menu values(1060, '生成代码', 116, '6', '#', '', '', '', 1, 0, 'F', '0', '0', 'tool:gen:code',              '#', 'admin', current_timestamp, '', null, '');
+-- 股票策略管理菜单
+insert into sys_menu values(121, '股票管理', 0, '4', 'stock', null, '', '', 1, 0, 'M', '0', '0', '', 'chart', 'admin', current_timestamp, '', null, '股票管理目录');
+insert into sys_menu values(122, '策略管理', 121, '1', 'strategy', 'stock/strategy/index', '', '', 1, 0, 'C', '0', '0', 'stock:strategy:list', 'trend-charts', 'admin', current_timestamp, '', null, '股票策略管理菜单');
+insert into sys_menu values(1121, '策略查询', 122, '1', '#', '', '', '', 1, 0, 'F', '0', '0', 'stock:strategy:list', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(1122, '策略运行', 122, '2', '#', '', '', '', 1, 0, 'F', '0', '0', 'stock:strategy:run', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(1123, '策略详情', 122, '3', '#', '', '', '', 1, 0, 'F', '0', '0', 'stock:strategy:detail', '#', 'admin', current_timestamp, '', null, '');
 
 -- ----------------------------
 -- 6、用户和角色关联表  用户N-1角色
@@ -486,6 +523,11 @@ insert into sys_role_menu values (2, 1057);
 insert into sys_role_menu values (2, 1058);
 insert into sys_role_menu values (2, 1059);
 insert into sys_role_menu values (2, 1060);
+insert into sys_role_menu values (2, 121);
+insert into sys_role_menu values (2, 122);
+insert into sys_role_menu values (2, 1121);
+insert into sys_role_menu values (2, 1122);
+insert into sys_role_menu values (2, 1123);
 insert into sys_role_menu values (2, 1061);
 insert into sys_role_menu values (2, 1062);
 insert into sys_role_menu values (2, 1063);

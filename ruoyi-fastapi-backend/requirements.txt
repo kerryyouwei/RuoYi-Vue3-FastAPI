@@ -1,6 +1,7 @@
 aiofiles==25.1.0
 alembic==1.18.5
 APScheduler==3.11.3
+backtrader==1.9.78.123
 async-lru==2.3.0
 asyncmy==0.2.11
 bcrypt==5.0.0

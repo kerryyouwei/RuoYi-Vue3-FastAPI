@@ -1,6 +1,37 @@
 -- Seed DATETIME values are UTC regardless of the server/session default timezone.
 SET time_zone = '+00:00';
 
+
+-- ----------------------------
+-- 股票策略回测记录表
+-- ----------------------------
+drop table if exists stock_strategy_run;
+create table stock_strategy_run (
+  run_id             varchar(36)   not null                    comment '回测运行ID',
+  strategy_name      varchar(64)   not null                    comment '策略模块名',
+  code               varchar(6)    not null                    comment '股票代码',
+  start_date         varchar(10)   not null                    comment '开始日期',
+  end_date           varchar(10)   not null                    comment '结束日期',
+  initial_cash       bigint        not null                    comment '初始资金',
+  commission_rate    varchar(32)   not null                    comment '手续费率',
+  stamp_tax_rate     varchar(32)   not null default '0.001'    comment '卖出印花税率',
+  benchmark_code     varchar(6)    default null                comment '基准代码',
+  strategy_params    json          not null                    comment '策略参数JSON',
+  status             varchar(16)   not null default 'pending'  comment 'pending/running/success/failed',
+  progress           bigint        not null default 0          comment '进度百分比',
+  error_message      text          default null                comment '错误信息',
+  summary            json          default null                comment '收益指标JSON',
+  curves             json          default null                comment '收益曲线JSON',
+  trades             json          default null                comment '成交明细JSON',
+  run_logs           json          default null                comment '运行日志JSON',
+  create_time        datetime(3)   default null                comment '创建时间',
+  update_time        datetime(3)   default null                comment '更新时间',
+  primary key (run_id),
+  key ix_stock_strategy_run_name (strategy_name),
+  key ix_stock_strategy_run_status (status)
+) engine=innodb comment = '股票策略回测记录表';
+
+
 -- ----------------------------
 -- 1、部门表
 -- ----------------------------
@@ -280,6 +311,12 @@ insert into sys_menu values('1057', '生成删除', '116', '3', '#', '', '', '',
 insert into sys_menu values('1058', '导入代码', '116', '4', '#', '', '', '', 1, 0, 'F', '0', '0', 'tool:gen:import',            '#', 'admin', sysdate(), '', null, '');
 insert into sys_menu values('1059', '预览代码', '116', '5', '#', '', '', '', 1, 0, 'F', '0', '0', 'tool:gen:preview',           '#', 'admin', sysdate(), '', null, '');
 insert into sys_menu values('1060', '生成代码', '116', '6', '#', '', '', '', 1, 0, 'F', '0', '0', 'tool:gen:code',              '#', 'admin', sysdate(), '', null, '');
+-- 股票策略管理菜单
+insert into sys_menu values('121', '股票管理', '0', '4', 'stock', null, '', '', 1, 0, 'M', '0', '0', '', 'chart', 'admin', sysdate(), '', null, '股票管理目录');
+insert into sys_menu values('122', '策略管理', '121', '1', 'strategy', 'stock/strategy/index', '', '', 1, 0, 'C', '0', '0', 'stock:strategy:list', 'trend-charts', 'admin', sysdate(), '', null, '股票策略管理菜单');
+insert into sys_menu values('1121', '策略查询', '122', '1', '#', '', '', '', 1, 0, 'F', '0', '0', 'stock:strategy:list', '#', 'admin', sysdate(), '', null, '');
+insert into sys_menu values('1122', '策略运行', '122', '2', '#', '', '', '', 1, 0, 'F', '0', '0', 'stock:strategy:run', '#', 'admin', sysdate(), '', null, '');
+insert into sys_menu values('1123', '策略详情', '122', '3', '#', '', '', '', 1, 0, 'F', '0', '0', 'stock:strategy:detail', '#', 'admin', sysdate(), '', null, '');
 
 
 -- ----------------------------
@@ -399,6 +436,11 @@ insert into sys_role_menu values ('2', '1057');
 insert into sys_role_menu values ('2', '1058');
 insert into sys_role_menu values ('2', '1059');
 insert into sys_role_menu values ('2', '1060');
+insert into sys_role_menu values ('2', '121');
+insert into sys_role_menu values ('2', '122');
+insert into sys_role_menu values ('2', '1121');
+insert into sys_role_menu values ('2', '1122');
+insert into sys_role_menu values ('2', '1123');
 insert into sys_role_menu values ('2', '1061');
 insert into sys_role_menu values ('2', '1062');
 insert into sys_role_menu values ('2', '1063');

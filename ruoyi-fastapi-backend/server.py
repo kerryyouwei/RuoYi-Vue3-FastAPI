@@ -14,6 +14,7 @@ from config.scheduler.manager import SchedulerManager
 from exceptions.handle import handle_exception
 from middlewares.handle import handle_middleware
 from module_admin.service.log_service import LogAggregatorService
+from module_stock.service.stock_strategy_service import StockStrategyService
 from plugins.core.runtime.application import get_plugin_application_runtime
 from sub_applications.handle import handle_sub_applications
 from utils.common_util import worship
@@ -78,6 +79,7 @@ async def _initialize_application_runtime(app: FastAPI, application_leader: bool
         stage='platform',
         log_success_enabled=application_leader,
     )
+    await StockStrategyService.recover_orphaned_runs()
 
     async def create_plugin_entity_tables() -> None:
         """在插件 writer 导入实体后同步插件表。"""
