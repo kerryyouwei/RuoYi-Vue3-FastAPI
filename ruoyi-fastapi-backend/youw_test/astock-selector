@@ -1,0 +1,40 @@
+import os
+import json
+import importlib.util
+from pathlib import Path
+
+SKILL_CLI_PATH = Path.home() / ".codex" / "skills" / "hithink-astock-selector" / "scripts" / "cli.py"
+
+
+def load_skill_cli():
+    spec = importlib.util.spec_from_file_location("hithink_astock_cli", SKILL_CLI_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def query_astock(query: str, limit: int = 100, page: int = 1, timeout: int = 60):
+    cli = load_skill_cli()
+
+    result = cli.query_astock(
+        query=query,
+        page=str(page),
+        limit=str(limit),
+        api_key=None,       # 默认读取环境变量 IWENCAI_API_KEY
+        call_type="normal",
+        timeout=timeout,
+    )
+
+    if "datas" not in result:
+        raise RuntimeError(f"查询失败: {json.dumps(result, ensure_ascii=False)}")
+
+    return result
+
+
+if __name__ == "__main__":
+    query = "昨日涨跌幅大于等于1%且小于等于7%，昨日成交额大于5亿元，昨日换手率大于等于5%且小于等于15%，MACD金叉"
+
+    result = query_astock(query)
+
+    print("命中数量:", result.get("code_count"))
+    print(json.dumps(result["datas"], ensure_ascii=False, indent=2))
