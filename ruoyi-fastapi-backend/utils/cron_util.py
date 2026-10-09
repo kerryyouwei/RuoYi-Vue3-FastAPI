@@ -159,26 +159,40 @@ class MyCronTrigger(CronTrigger):
         )
 
     @classmethod
+    @classmethod
     def _weekday_names(cls, expression: str) -> str:
         """
-        将Quartz星期编号转换为APScheduler星期名称
+        将Quartz星期编号或名称转换为APScheduler星期名称
 
-        Quartz的1表示星期日；APScheduler的数字0表示星期一。
+        Quartz的1表示星期日；支持数字和三字母名称两种形式。
 
-        :param expression: Quartz周字段表达式
+        :param expression: Quartz周字段表达式（如：2-6 或 MON-FRI）
         :return: 逗号分隔的星期名称
         """
         weekdays = set()
         for part in expression.split(','):
             match = re.fullmatch(r'([1-7])(?:-([1-7]))?', part)
-            if not match:
-                raise ValueError(f'无效的 Cron 周字段：{expression}')
-            first, last = int(match[1]), int(match[2] or match[1])
+            if match:
+                first, last = int(match[1]), int(match[2] or match[1])
+            else:
+                name_match = re.fullmatch(r'([A-Za-z]{3})(?:-([A-Za-z]{3}))?', part, re.IGNORECASE)
+                if not name_match:
+                    raise ValueError(f'无效的 Cron 周字段：{expression}')
+                first = cls._weekday_number(name_match[1])
+                last = cls._weekday_number(name_match[2]) if name_match[2] else first
             if first > last:
                 raise ValueError('Cron 周范围的结束值不能早于开始值')
             weekdays.update(range(first, last + 1))
         return ','.join(cls.WEEKDAYS[day - 1] for day in sorted(weekdays))
 
+    @classmethod
+    def _weekday_number(cls, name: str) -> int:
+        """将三字母星期名转换为 Quartz 编号（1=Sun … 7=Sat）。"""
+        normalized = name.lower()
+        for index, weekday in enumerate(cls.WEEKDAYS):
+            if weekday == normalized:
+                return index + 1
+        raise ValueError(f'无效的星期名称：{name}')
 
 class CronUtil:
     """

@@ -28,6 +28,23 @@ class StockPoolDao:
         return set(rows.scalars().all())
 
     @staticmethod
+    async def codes_by_pool(db: AsyncSession, pool_name: str) -> list[tuple[str, str | None]]:
+        """按股票池名返回去重后的 (代码, 简称) 列表。"""
+        rows = await db.execute(
+            select(StockPoolItem.code, StockPoolItem.name)
+            .where(StockPoolItem.pool_name == pool_name)
+            .order_by(StockPoolItem.code)
+        )
+        seen: set[str] = set()
+        result: list[tuple[str, str | None]] = []
+        for code, name in rows:
+            if code in seen:
+                continue
+            seen.add(code)
+            result.append((code, name))
+        return result
+
+    @staticmethod
     async def list_page(db: AsyncSession, query: StockPoolQueryModel) -> PageModel:
         stmt = select(StockPoolItem).order_by(StockPoolItem.create_time.desc(), StockPoolItem.id.desc())
         stmt = StockPoolDao._filter(stmt, query)
@@ -55,4 +72,3 @@ class StockPoolDao:
             keyword = f'%{query.keyword}%'
             stmt = stmt.where(StockPoolItem.code.like(keyword) | StockPoolItem.name.like(keyword))
         return stmt
-

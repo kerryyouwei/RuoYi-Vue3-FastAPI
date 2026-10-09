@@ -66,3 +66,6 @@ keep-runtime-typing = true
 [format]
 docstring-code-format = true
 quote-style = "single"
+
+[lint.per-file-ignores]
+"tests/**" = ["PLR2004", "N806", "PLC0415", "ANN001", "S101"]

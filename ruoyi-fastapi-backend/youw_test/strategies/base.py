@@ -11,12 +11,16 @@ class BaseStrategy(bt.Strategy):
     def __init__(self):
         self.pending_order = None
         self.execution_records = []
+        self.signal = '持有'
+        self.signal_reason = ''
 
     def log(self, message):
         current_date = self.datas[0].datetime.date(0).isoformat()
         print(f"[{current_date}] {message}")
 
     def buy_position(self, reason):
+        self.signal = '买入'
+        self.signal_reason = reason
         # 不加仓：已有持仓或挂单时，新的买入信号直接忽略。
         if self.pending_order is not None or self.position:
             self.log(f"已有持仓或挂单，忽略买入信号({reason})")
@@ -57,6 +61,8 @@ class BaseStrategy(bt.Strategy):
         return size
 
     def close_position(self, reason):
+        self.signal = '卖出'
+        self.signal_reason = reason
         if self.pending_order is not None or not self.position:
             return
         self.log(

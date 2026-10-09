@@ -70,7 +70,7 @@ class StockDayService:
         end = query.end.isoformat()
 
         try:
-            data_frame = QA.QA_fetch_get_stock_day('baostock', query.code, start, end)
+            data_frame = QA.QA_fetch_get_stock_day('baostock', query.code, start, end, if_fq='01')
         except Exception as exc:
             raise ServiceException(message=f'从Baostock获取股票{query.code}日线数据失败') from exc
 

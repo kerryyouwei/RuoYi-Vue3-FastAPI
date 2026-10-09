@@ -6,9 +6,10 @@ import contextlib
 import io
 import math
 import re
+import threading
 import traceback
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import DataSourceRegistry
 from exceptions.exception import ServiceException
-from utils.log_util import logger
 from module_stock.dao.stock_strategy_dao import StockStrategyDao
 from module_stock.entity.do.stock_strategy_do import StockStrategyRun
+from module_stock.entity.vo.stock_day_vo import StockDayImportModel
 from module_stock.entity.vo.stock_strategy_vo import (
     StrategyDetailModel,
     StrategyHistoryQueryModel,
@@ -27,7 +28,10 @@ from module_stock.entity.vo.stock_strategy_vo import (
     StrategyRunRequest,
     StrategyRunStatusModel,
 )
+from module_stock.service.stock_day_service import StockDayService
+from utils.log_util import logger
 
+_WEEKDAY_LIMIT = 5  # weekday() < 5 means Mon-Fri
 _STRATEGY_NAME = re.compile(r'^[a-z][a-z0-9_]*$')
 _ROOT = Path(__file__).resolve().parents[2]
 _STRATEGY_DIR = _ROOT / 'youw_test' / 'strategies'
@@ -222,7 +226,18 @@ class StockStrategyService:
         }
         logger.bind(**run_context).info(f'股票策略回测开始执行：{run.strategy_name}')
         try:
-            result = await asyncio.to_thread(cls._run_backtest, run)
+            result = await asyncio.to_thread(
+                cls.backtest_once,
+                run.strategy_name,
+                run.code,
+                run.start_date,
+                run.end_date,
+                run.initial_cash,
+                float(run.commission_rate),
+                float(run.stamp_tax_rate),
+                run.benchmark_code,
+                run.strategy_params,
+            )
             logger.bind(run_id=run_id).info('股票策略回测结果已生成，准备写入数据库')
             async with DataSourceRegistry.session(log_sql=False) as db:
                 await StockStrategyDao.update(db, run_id, status='success', progress=100, **result)
@@ -267,39 +282,101 @@ class StockStrategyService:
     def _live_start_strategy(strategy_cls: type, live_start_date):
         """Allow the prior close to fill on the requested start date."""
         class _LiveStartStrategy(strategy_cls):
-            def next(self):
+            def next(self) -> None:
                 if self.datas[0].datetime.date(0) < live_start_date:
                     return
                 super().next()
 
         return _LiveStartStrategy
 
+    _BAOSTOCK_IMPORT_LOCK = threading.Lock()
+
+    @staticmethod
+    def _count_weekdays(start: date, end: date) -> int:
+        """统计区间内工作日数量（近似交易日，未扣节假日）。"""
+        days = 0
+        current = start
+        while current <= end:
+            if current.weekday() < _WEEKDAY_LIMIT:
+                days += 1
+            current += timedelta(days=1)
+        return days
+
     @classmethod
-    def _run_backtest(cls, run: StockStrategyRun) -> dict[str, Any]:
+    def _is_stock_day_data_complete(cls, data: Any, start_date: str, end_date: str) -> bool:
+        """判断MongoDB日线数据是否覆盖请求区间（允许节假日与短期停牌误差）。"""
+        if data is None or getattr(data, 'empty', True):
+            return False
+        start = date.fromisoformat(str(start_date)[:10])
+        end = date.fromisoformat(str(end_date)[:10])
+        data_start = data.index[0].date()
+        data_end = data.index[-1].date()
+        if data_start > start + timedelta(days=10):
+            return False
+        if data_end < end - timedelta(days=5):
+            return False
+        weekdays = cls._count_weekdays(start, end)
+        return not (weekdays > 0 and len(data) < weekdays * 0.75)
+
+    @classmethod
+    def _ensure_stock_day_data(cls, code: str, start_date: str, end_date: str) -> None:
+        """回测前检查MongoDB日线完整性，缺失时自动从Baostock补齐（失败不阻断回测）。"""
+        data = cls._load_qa_daily_data(code, start_date, end_date, index=False)
+        if cls._is_stock_day_data_complete(data, start_date, end_date):
+            return
+        logger.bind(code=code, start=start_date, end=end_date).info('MongoDB日线数据不完整，尝试从Baostock自动补齐')
+        try:
+            with cls._BAOSTOCK_IMPORT_LOCK:
+                result = StockDayService._import_stock_day_data(
+                    StockDayImportModel(
+                        code=code,
+                        start=date.fromisoformat(str(start_date)[:10]),
+                        end=date.fromisoformat(str(end_date)[:10]),
+                    )
+                )
+            logger.bind(code=code, fetched=result.fetched_count, inserted=result.inserted_count).info('Baostock日线数据补齐完成')
+        except Exception as exc:
+            logger.bind(code=code).warning(f'Baostock补齐日线数据失败（回测将使用现有数据继续）：{exc}')
+
+    @classmethod
+    def backtest_once(
+        cls,
+        strategy_name: str,
+        code: str,
+        start_date: str,
+        end_date: str,
+        initial_cash: int,
+        commission_rate: float,
+        stamp_tax_rate: float,
+        benchmark_code: str | None,
+        strategy_params: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """对单只标的执行一次 Backtrader 回测，返回 summary/curves/trades/run_logs。"""
         try:
             import backtrader as bt
+
             from youw_test.strategies import load_strategy
         except ImportError as exc:
             raise RuntimeError('缺少 Backtrader、QUANTAXIS 或其运行依赖') from exc
 
-        strategy_cls = load_strategy(run.strategy_name)
-        strategy_params = run.strategy_params or {}
+        strategy_cls = load_strategy(strategy_name)
+        strategy_params = strategy_params or {}
         warmup_bars = cls._strategy_warmup_bars(strategy_cls, strategy_params)
-        data_start_date = cls._warmup_start_date(run.start_date, warmup_bars)
-        requested_start_date = datetime.strptime(str(run.start_date)[:10], '%Y-%m-%d').date()
+        data_start_date = cls._warmup_start_date(start_date, warmup_bars)
+        requested_start_date = datetime.strptime(str(start_date)[:10], '%Y-%m-%d').date()
 
         logger.bind(
-            run_id=run.run_id,
-            strategy_name=run.strategy_name,
-            code=run.code,
-            start_date=run.start_date,
-            end_date=run.end_date,
+            strategy_name=strategy_name,
+            code=code,
+            start_date=start_date,
+            end_date=end_date,
         ).info('股票策略回测正在加载行情数据')
         logs = io.StringIO()
         with contextlib.redirect_stdout(logs):
-            data = cls._load_stock_data(run.code, data_start_date, run.end_date)
+            cls._ensure_stock_day_data(code, data_start_date, end_date)
+            data = cls._load_stock_data(code, data_start_date, end_date)
             if data is None:
-                raise RuntimeError(f'未查询到股票{run.code}在{data_start_date}至{run.end_date}的日线数据，请先导入行情数据')
+                raise RuntimeError(f'未查询到股票{code}在{data_start_date}至{end_date}的日线数据，请先导入行情数据')
             available_dates = list(data.index)
             first_live_fill_date = next(
                 (day for day in available_dates if day.date() >= requested_start_date),
@@ -308,7 +385,6 @@ class StockStrategyService:
             prior_dates = [day for day in available_dates if day.date() < first_live_fill_date.date()]
             signal_start_date = max(prior_dates).date() if prior_dates else first_live_fill_date.date()
             logger.bind(
-                run_id=run.run_id,
                 data_rows=len(data),
                 data_start=str(data.index.min()),
                 data_end=str(data.index.max()),
@@ -316,31 +392,32 @@ class StockStrategyService:
                 requested_start=str(requested_start_date),
                 signal_start=str(signal_start_date),
                 first_fill=str(first_live_fill_date.date()),
+                code=code,
             ).info('股票策略回测行情数据加载完成')
             cerebro = bt.Cerebro()
-            cerebro.adddata(bt.feeds.PandasData(dataname=data), name=run.code)
+            cerebro.adddata(bt.feeds.PandasData(dataname=data), name=code)
 
             # 组合策略可以通过 UNIVERSE 声明多个标的；主时钟标的本身不要重复加入。
             universe = [
-                code for code in (getattr(strategy_cls, 'UNIVERSE', None) or [])
-                if code != run.code
+                universe_code for universe_code in (getattr(strategy_cls, 'UNIVERSE', None) or [])
+                if universe_code != code
             ]
             for universe_code in universe:
-                universe_data = cls._load_stock_data(universe_code, data_start_date, run.end_date)
+                universe_data = cls._load_stock_data(universe_code, data_start_date, end_date)
                 if universe_data is None:
-                    logger.bind(run_id=run.run_id, universe_code=universe_code).warning('组合策略标的未加载到数据，已跳过')
+                    logger.bind(universe_code=universe_code).warning('组合策略标的未加载到数据，已跳过')
                     continue
                 cerebro.adddata(
                     bt.feeds.PandasData(dataname=universe_data),
                     name=universe_code,
                 )
-            logger.bind(run_id=run.run_id, feeds=len(cerebro.datas)).info('组合策略行情数据加载完成')
+            logger.bind(feeds=len(cerebro.datas), code=code).info('组合策略行情数据加载完成')
 
             cerebro.addstrategy(
                 cls._live_start_strategy(strategy_cls, signal_start_date),
                 **strategy_params,
             )
-            cerebro.broker.setcash(run.initial_cash)
+            cerebro.broker.setcash(initial_cash)
 
             # A股卖出额外收取印花税；原版 JoinQuant 设置为千分之一。
             # Backtrader 默认只有买卖同一佣金，因此这里用自定义佣金方案。
@@ -361,8 +438,8 @@ class StockStrategyService:
 
             cerebro.broker.addcommissioninfo(
                 _StockCommissionInfo(
-                    commission=float(run.commission_rate),
-                    stamp_duty=float(run.stamp_tax_rate),
+                    commission=float(commission_rate),
+                    stamp_duty=float(stamp_tax_rate),
                     min_commission=5.0,
                 )
             )
@@ -375,9 +452,9 @@ class StockStrategyService:
             strategy = strategies[0]
             end_value = cerebro.broker.getvalue()
         logger.bind(
-            run_id=run.run_id,
             initial_cash=float(start_value),
             ending_value=float(end_value),
+            code=code,
         ).info('股票策略回测引擎执行完成')
 
         returns = strategy.analyzers.returns.get_analysis()
@@ -385,7 +462,7 @@ class StockStrategyService:
         value = float(start_value)
         for day, rate in returns.items():
             date_str = str(day)[:10]
-            if date_str < str(run.start_date)[:10]:
+            if date_str < str(start_date)[:10]:
                 continue
             value *= 1 + float(rate or 0)
             dates.append(date_str)
@@ -402,10 +479,10 @@ class StockStrategyService:
         gross_win = float((trade_won.get('pnl') or {}).get('total', 0) or 0)
         gross_loss = abs(float((trade_lost.get('pnl') or {}).get('total', 0) or 0))
         benchmark = None
-        if run.benchmark_code:
-            benchmark_data = cls._load_stock_data(run.benchmark_code, run.start_date, run.end_date)
+        if benchmark_code:
+            benchmark_data = cls._load_stock_data(benchmark_code, start_date, end_date)
             if benchmark_data is None:
-                raise RuntimeError(f'未查询到基准{run.benchmark_code}在{run.start_date}至{run.end_date}的日线数据')
+                raise RuntimeError(f'未查询到基准{benchmark_code}在{start_date}至{end_date}的日线数据')
             close = benchmark_data['close']
             benchmark_by_date = {
                 str(day)[:10]: round(float(price / close.iloc[0] - 1), 6) for day, price in close.items()
@@ -432,7 +509,7 @@ class StockStrategyService:
         for value in equity:
             peak = max(peak, value)
             drawdown_curve.append(round(value / peak - 1, 6) if peak else 0)
-        logger.bind(run_id=run.run_id, equity_points=len(equity), trade_count=closed).info('股票策略回测结果处理完成')
+        logger.bind(equity_points=len(equity), trade_count=closed, code=code).info('股票策略回测结果处理完成')
         curves = {
             'dates': dates,
             'strategyEquity': equity,
@@ -446,7 +523,7 @@ class StockStrategyService:
         }
         trades = [
             record for record in getattr(strategy, 'execution_records', [])
-            if record.get('date', '') >= str(run.start_date)[:10]
+            if record.get('date', '') >= str(start_date)[:10]
         ]
         return {'summary': summary, 'curves': curves, 'trades': trades, 'run_logs': logs.getvalue().splitlines()}
 
@@ -497,14 +574,14 @@ class StockStrategyService:
 
     @classmethod
     def _status_model(cls, run: StockStrategyRun, detail: bool = False):
-        payload = dict(
-            run_id=run.run_id,
-            strategy_name=run.strategy_name,
-            status=run.status,
-            progress=run.progress,
-            error_message=run.error_message,
-            summary=run.summary,
-        )
+        payload = {
+            'run_id': run.run_id,
+            'strategy_name': run.strategy_name,
+            'status': run.status,
+            'progress': run.progress,
+            'error_message': run.error_message,
+            'summary': run.summary,
+        }
         if not detail:
             return StrategyRunStatusModel(**payload)
         return StrategyRunDetailModel(
