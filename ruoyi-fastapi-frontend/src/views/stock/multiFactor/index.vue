@@ -143,7 +143,7 @@
 </template>
 
 <script setup name="MultiFactor">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   calculateMultiFactor,
@@ -169,6 +169,8 @@ const poolDialogVisible = ref(false)
 const poolName = ref('default')
 const poolNames = ref([])
 const poolAdding = ref(false)
+let calcTimer = null
+let calcPollCount = 0
 
 onMounted(() => {
   loadLatestBatch()
@@ -217,25 +219,59 @@ async function loadResults() {
 
 async function handleCalculate() {
   calculating.value = true
+  const previousBatchId = batchInfo.value?.batchId
   try {
     const res = await calculateMultiFactor()
-    ElMessage.success(`计算完成！共${res.data.totalCount}只，入选${res.data.selectedCount}只，耗时${res.data.elapsedSeconds}s`)
-    batchInfo.value = {
-      batchId: res.data.batchId,
-      calcDate: res.data.calcDate,
-      totalCount: res.data.totalCount,
-      selectedCount: res.data.selectedCount,
-      degradedFactors: res.data.degradedFactors
-    }
-    hasResults.value = true
-    pageNum.value = 1
-    loadResults()
+    ElMessage.info(res.msg || '已开始后台计算，请稍后刷新结果')
+    startCalcPolling(previousBatchId)
   } catch (e) {
-    ElMessage.error(e.msg || '计算失败，请稍后重试')
-  } finally {
     calculating.value = false
+    ElMessage.error(e.msg || '启动计算失败，请稍后重试')
   }
 }
+
+function startCalcPolling(previousBatchId) {
+  if (calcTimer) {
+    clearTimeout(calcTimer)
+    calcTimer = null
+  }
+  calcPollCount = 0
+
+  const poll = async () => {
+    calcPollCount += 1
+    try {
+      const res = await getLatestBatch()
+      const nextBatchId = res.data?.batchId
+      if (nextBatchId && nextBatchId !== previousBatchId) {
+        batchInfo.value = res.data
+        hasResults.value = true
+        calculating.value = false
+        pageNum.value = 1
+        loadResults()
+        ElMessage.success(`计算完成！共${res.data.totalCount}只，入选${res.data.selectedCount}只`)
+        return
+      }
+    } catch (e) {
+      console.warn('查询计算进度失败', e)
+    }
+
+    if (calcPollCount >= 180) {
+      calculating.value = false
+      ElMessage.warning('后台计算时间较长，可稍后点击“刷新”查看结果')
+      return
+    }
+    calcTimer = setTimeout(poll, 10000)
+  }
+
+  poll()
+}
+
+onUnmounted(() => {
+  if (calcTimer) {
+    clearTimeout(calcTimer)
+    calcTimer = null
+  }
+})
 
 async function handleAddToPool() {
   poolDialogVisible.value = true

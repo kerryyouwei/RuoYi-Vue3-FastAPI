@@ -4,13 +4,13 @@ from fastapi import Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.aspect.db_session import DBSessionDependency
+
 from common.aspect.interface_auth import UserInterfaceAuthDependency
 from common.aspect.pre_auth import PreAuthDependency
 from common.router import APIRouterPro
 from common.vo import DataResponseModel, PageResponseModel, ResponseBaseModel
 from module_stock.entity.vo.multi_factor_vo import (
     MultiFactorBatchInfoModel,
-    MultiFactorCalcResultModel,
     MultiFactorPoolAddRequestModel,
     MultiFactorPoolAddResultModel,
     MultiFactorResultQueryModel,
@@ -27,21 +27,22 @@ multi_factor_controller = APIRouterPro(
 
 @multi_factor_controller.post(
     '/calculate',
-    summary='触发多因子计算',
-    description='拉取Baostock全市场数据，计算7因子加权得分，返回计算摘要',
-    response_model=DataResponseModel[MultiFactorCalcResultModel],
+    summary='触发多因子后台计算',
+    description='启动多因子计算后台任务，立即返回；结果请轮询最新批次接口',
+    response_model=DataResponseModel[dict],
     dependencies=[UserInterfaceAuthDependency('stock:multiFactor:calculate')],
 )
-async def calculate_multi_factor(
-    request: Request,
-    db: Annotated[AsyncSession, DBSessionDependency()],
-) -> Response:
-    result = await MultiFactorService.calculate(db)
-    logger.info(
-        f'多因子计算完成: batch={result.batch_id} 总数={result.total_count} '
-        f'入选={result.selected_count} 耗时={result.elapsed_seconds}s'
+async def calculate_multi_factor(request: Request) -> Response:
+    started = MultiFactorService.start_background_calculation()
+    if started:
+        return ResponseUtil.success(
+            data={'started': True, 'running': True},
+            msg='已开始后台计算，请稍后刷新结果',
+        )
+    return ResponseUtil.success(
+        data={'started': False, 'running': True},
+        msg='多因子计算正在进行中',
     )
-    return ResponseUtil.success(data=result, msg='计算完成')
 
 
 @multi_factor_controller.get(

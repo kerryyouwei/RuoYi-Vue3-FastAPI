@@ -8,8 +8,10 @@
 """
 
 import asyncio
+import math
 import time
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 import pandas as pd
@@ -31,6 +33,8 @@ _LOGGED_IN = False
 _INDUSTRY_CACHE_TTL_DAYS = 7
 # K线最少保留天数
 _KLINE_MIN_DAYS = 120
+# Baostock逐只请求间隔，避免触发限流；网络请求本身才是主要耗时
+_KLINE_FETCH_SLEEP_SECONDS = 0.02
 
 
 async def _ensure_login() -> None:
@@ -134,7 +138,7 @@ class BaostockDataService:
 
         返回 DataFrame 列: code, pure_code, date, close, peTTM, pbMRQ, turn, volume, amount
         """
-        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days)).date()
         all_records: list[MultiFactorKlineCache] = []
         codes_need_fetch: list[tuple[str, str]] = []  # (bs_code, from_date)
 
@@ -170,7 +174,7 @@ class BaostockDataService:
         # 4. 增量拉取缺失部分
         if codes_need_fetch:
             logger.info(f'K线需要增量拉取: {len(codes_need_fetch)} 只股票')
-            new_records = await cls._fetch_kline_incremental(codes_need_fetch, days)
+            new_records = await cls._fetch_kline_incremental(db, codes_need_fetch, days)
             all_records.extend(new_records)
             # 写入DB
             if new_records:
@@ -182,14 +186,16 @@ class BaostockDataService:
 
     @classmethod
     async def _fetch_kline_incremental(
-        cls, codes_with_dates: list[tuple[str, str]], days: int
+        cls, db: AsyncSession, codes_with_dates: list[tuple[str, str]], days: int
     ) -> list[MultiFactorKlineCache]:
-        """从Baostock增量拉取K线数据并转为缓存记录。"""
+        """从Baostock增量拉取K线数据，并分批落库，避免长任务中断后全部丢失。"""
         await _ensure_login()
         import baostock as bs
 
         end_date = datetime.now().strftime('%Y-%m-%d')
         all_records: list[MultiFactorKlineCache] = []
+        pending_records: list[MultiFactorKlineCache] = []
+        processed_since_commit = 0
 
         def _query_one(code: str, from_date: str) -> pd.DataFrame:
             rs = bs.query_history_k_data_plus(
@@ -203,12 +209,13 @@ class BaostockDataService:
             return _bs_query_to_df(rs)
 
         for i, (bs_code, from_date) in enumerate(codes_with_dates):
+            code_records: list[MultiFactorKlineCache] = []
             try:
                 df = await asyncio.to_thread(_query_one, bs_code, from_date)
                 for _, row in df.iterrows():
                     if not row.get('date'):
                         continue
-                    all_records.append(MultiFactorKlineCache(
+                    code_records.append(MultiFactorKlineCache(
                         code=bs_code,
                         pure_code=bs_code.split('.')[1],
                         trade_date=date.fromisoformat(str(row['date'])[:10]),
@@ -221,9 +228,22 @@ class BaostockDataService:
                     ))
             except Exception as exc:
                 logger.warning(f'K线增量拉取失败 code={bs_code}: {exc}')
+
+            if code_records:
+                pending_records.extend(code_records)
+
+            processed_since_commit += 1
+            if processed_since_commit >= 50 or i == len(codes_with_dates) - 1:
+                if pending_records:
+                    written = await MultiFactorCacheDao.upsert_kline(db, pending_records)
+                    await db.commit()
+                    all_records.extend(pending_records)
+                    pending_records = []
+                processed_since_commit = 0
+
             if i % 50 == 0 and i > 0:
                 logger.info(f'K线增量拉取进度: {i}/{len(codes_with_dates)}')
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(_KLINE_FETCH_SLEEP_SECONDS)
 
         return all_records
 
@@ -298,55 +318,52 @@ class BaostockDataService:
 
     @classmethod
     async def _fetch_financial_by_quarters(cls, quarters: list[tuple[int, int]]) -> list[MultiFactorFinancialCache]:
-        """从Baostock拉取指定季度的财务数据。"""
-        await _ensure_login()
-        import baostock as bs
+        """拉取指定季度财务数据。
+
+        Baostock 的财务接口不支持 code 为空的批量查询，这里改用 akshare/Eastmoney
+        的业绩报表接口，一次拉取全市场指定季度数据。
+        """
+        import akshare as ak
+
         all_records: list[MultiFactorFinancialCache] = []
+        quarter_days = {1: '0331', 2: '0630', 3: '0930', 4: '1231'}
 
         for y, q in quarters:
-            def _query_profit(yy=y, qq=q):
-                rs = bs.query_profit_data(code='', year=yy, quarter=qq)
-                return _bs_query_to_df(rs)
+            report_date = f'{y}{quarter_days[q]}'
 
-            def _query_growth(yy=y, qq=q):
-                rs = bs.query_growth_data(code='', year=yy, quarter=qq)
-                return _bs_query_to_df(rs)
+            def _query(report_date=report_date):
+                return ak.stock_yjbb_em(date=report_date)
 
             try:
-                profit_df = await asyncio.to_thread(_query_profit)
-                growth_df = await asyncio.to_thread(_query_growth)
+                df = await asyncio.to_thread(_query)
             except Exception as exc:
-                logger.warning(f'Baostock财务拉取失败 {y}Q{q}: {exc}')
+                logger.warning(f'财务数据拉取失败 {y}Q{q}: {exc}')
                 continue
 
-            if profit_df.empty and growth_df.empty:
+            if df is None or df.empty:
+                logger.info(f'财务数据无可用记录 {y}Q{q}')
                 continue
 
-            # 合并 profit 和 growth
-            if not profit_df.empty and not growth_df.empty:
-                merge_cols = ['code', 'pubDate', 'statDate']
-                merged = pd.merge(profit_df, growth_df, on=merge_cols, how='outer', suffixes=('', '_g'))
-            elif not profit_df.empty:
-                merged = profit_df
-            else:
-                merged = growth_df
-
-            for _, row in merged.iterrows():
-                bs_code = row.get('code', '')
-                if not bs_code:
+            count = 0
+            for _, row in df.iterrows():
+                pure_code = str(row.get('股票代码', '')).zfill(6)
+                if len(pure_code) != 6 or not pure_code.isdigit():
                     continue
+                bs_code = ('sh.' if pure_code.startswith('6') else 'sz.') + pure_code
                 all_records.append(MultiFactorFinancialCache(
                     code=bs_code,
-                    pure_code=bs_code.split('.')[1] if '.' in str(bs_code) else str(bs_code),
+                    pure_code=pure_code,
                     year=y,
                     quarter=q,
-                    roe_avg=_to_decimal(row.get('roeAvg')),
-                    np_margin=_to_decimal(row.get('npMargin')),
-                    yoy_ni=_to_decimal(row.get('YOYNI')),
-                    yoy_equity=_to_decimal(row.get('YOYEquity')),
-                    stat_date=_to_date(row.get('statDate')),
-                    pub_date=_to_date(row.get('pubDate')),
+                    roe_avg=_to_decimal(row.get('净资产收益率')),
+                    np_margin=_to_decimal(row.get('销售毛利率')),
+                    yoy_ni=_to_decimal(row.get('净利润-同比增长')),
+                    yoy_equity=None,
+                    stat_date=_to_date(report_date),
+                    pub_date=_to_date(row.get('最新公告日期')),
                 ))
+                count += 1
+            logger.info(f'财务数据拉取成功 {y}Q{q}: {count} 条')
 
         return all_records
 
@@ -476,14 +493,14 @@ class BaostockDataService:
         """旧接口，不带缓存。保留供测试用。"""
         await _ensure_login()
         import baostock as bs
-        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days)).date()
         end_date = datetime.now().strftime('%Y-%m-%d')
         all_frames: list[pd.DataFrame] = []
 
         def _query_one(code: str) -> pd.DataFrame:
             rs = bs.query_history_k_data_plus(
                 code, 'date,code,close,peTTM,pbMRQ,turn,volume,amount',
-                start_date=start_date, end_date=end_date, frequency='d', adjustflag='2',
+                start_date=start_date.strftime('%Y-%m-%d'), end_date=end_date, frequency='d', adjustflag='2',
             )
             return _bs_query_to_df(rs)
 
@@ -494,7 +511,7 @@ class BaostockDataService:
                     all_frames.append(df)
             except Exception:
                 pass
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(_KLINE_FETCH_SLEEP_SECONDS)
 
         if not all_frames:
             return pd.DataFrame()
@@ -520,17 +537,26 @@ class BaostockDataService:
         await _logout()
 
 
-def _to_decimal(value) -> float | None:
-    """安全转为 float（用于 Numeric 列）。"""
+def _to_decimal(value) -> Decimal | None:
+    """安全转为 DECIMAL(12,4)，兼容字符串百分比、千分位和非法值。"""
     if value is None or value == '':
         return None
+    text = str(value).strip().replace(',', '').replace('%', '')
+    if not text or text in {'-', '--'}:
+        return None
     try:
-        result = float(value)
-        if pd.isna(result) or pd.isinf(result):
-            return None
-        return result
+        result = float(text)
     except (ValueError, TypeError):
         return None
+    if math.isnan(result) or math.isinf(result):
+        return None
+    try:
+        result_decimal = Decimal(text).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    if abs(result_decimal) >= Decimal('100000000'):
+        return None
+    return result_decimal
 
 
 def _to_date(value) -> date | None:

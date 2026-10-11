@@ -14,6 +14,7 @@ from config.scheduler.manager import SchedulerManager
 from exceptions.handle import handle_exception
 from middlewares.handle import handle_middleware
 from module_admin.service.log_service import LogAggregatorService
+from module_stock.service.multi_factor_service import MultiFactorService
 from module_stock.service.stock_strategy_service import StockStrategyService
 from plugins.core.runtime.application import get_plugin_application_runtime
 from sub_applications.handle import handle_sub_applications
@@ -51,15 +52,19 @@ async def _stop_background_tasks(app: FastAPI) -> None:
                 pass
     finally:
         try:
-            redis = getattr(app.state, 'redis', None)
-            if redis is not None:
-                try:
-                    # Scheduler负责停止续期并释放Application租约，必须先于Redis连接池关闭。
-                    await SchedulerManager.close_system_scheduler()
-                finally:
-                    await RedisUtil.close_redis_pool(app)
+            # 先取消长耗时业务后台任务，避免数据库会话在资源释放后被继续使用。
+            await MultiFactorService.cancel_background_calculation()
         finally:
-            await DataSourceRegistry.dispose_all()
+            try:
+                redis = getattr(app.state, 'redis', None)
+                if redis is not None:
+                    try:
+                        # Scheduler负责停止续期并释放Application租约，必须先于Redis连接池关闭。
+                        await SchedulerManager.close_system_scheduler()
+                    finally:
+                        await RedisUtil.close_redis_pool(app)
+            finally:
+                await DataSourceRegistry.dispose_all()
 
 
 async def _initialize_application_runtime(app: FastAPI, application_leader: bool) -> None:

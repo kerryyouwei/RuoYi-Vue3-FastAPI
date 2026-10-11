@@ -3,13 +3,14 @@
 import asyncio
 import time
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.vo import PageModel
+from config.database import DataSourceRegistry
 from exceptions.exception import ServiceException
 from module_stock.dao.multi_factor_dao import MultiFactorDao
 from module_stock.dao.stock_pool_dao import StockPoolDao
@@ -100,6 +101,60 @@ class MultiFactorService:
 
     # 计算状态缓存（内存）
     _calc_status: dict[str, dict] = {}
+    _calc_running: bool = False
+    _calc_task: asyncio.Task | None = None
+
+    @classmethod
+    @property
+    def is_calculating(cls) -> bool:
+        """是否正在后台计算。"""
+        return cls._calc_running
+
+    @classmethod
+    def start_background_calculation(cls) -> bool:
+        """启动后台计算任务，返回是否成功启动。"""
+        if cls._calc_running:
+            return False
+        cls._calc_running = True
+        cls._calc_task = asyncio.create_task(cls._calculate_in_background())
+        return True
+
+    @classmethod
+    async def cancel_background_calculation(cls) -> None:
+        """取消后台计算并等待任务退出，避免应用关闭时破坏数据库会话。"""
+        task = cls._calc_task
+        if task is None or task.done():
+            cls._calc_running = False
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        cls._calc_running = False
+        cls._calc_task = None
+
+    @classmethod
+    async def _calculate_in_background(cls) -> None:
+        """使用独立数据库会话执行计算，不受HTTP请求超时/断开影响。"""
+        try:
+            async with DataSourceRegistry.session() as db:
+                result = await cls.calculate(db)
+            cls._calc_status = {
+                'status': 'completed',
+                'batch_id': result.batch_id,
+                'total_count': result.total_count,
+                'selected_count': result.selected_count,
+            }
+        except asyncio.CancelledError:
+            cls._calc_status = {'status': 'cancelled'}
+            raise
+        except Exception as exc:
+            cls._calc_status = {'status': 'failed', 'message': str(exc)}
+            logger.exception('多因子后台计算失败')
+        finally:
+            cls._calc_running = False
+            cls._calc_task = None
 
     @classmethod
     async def calculate(cls, db: AsyncSession) -> MultiFactorCalcResultModel:
@@ -381,8 +436,7 @@ class MultiFactorService:
         if not batch_id:
             batch_id = await MultiFactorDao.get_latest_batch_id(db)
             if not batch_id:
-                return PageModel(rows=[], page_num=query.page_num, page_size=query.page_size, has_next=False,
-                                 total=0, total_pages=0)
+                return PageModel(rows=[], pageNum=query.page_num, pageSize=query.page_size, hasNext=False, total=0)
         return await MultiFactorDao.list_page(db, query, batch_id)
 
     @classmethod
