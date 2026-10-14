@@ -33,7 +33,7 @@ class MultiFactorResult(AuditTimeMixin, Base):
     northbound_net = Column(Numeric(16, 2), nullable=True, comment='北向持仓变化值(万元)')
     industry_name = Column(String(50), nullable=True, comment='所属行业')
     industry_growth = Column(Numeric(10, 4), nullable=True, comment='行业营收增速')
-    selected = Column(SmallInteger, nullable=False, default=0, comment='是否入选(>=90分)')
+    selected = Column(SmallInteger, nullable=False, default=0, comment='是否入选(按配置阈值)')
     factor_degraded = Column(String(255), nullable=True, comment='降级因子说明')
     calc_date = Column(Date, nullable=False, comment='计算日期')
 

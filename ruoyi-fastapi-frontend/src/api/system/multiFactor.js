@@ -34,6 +34,15 @@ export function getFactorWeights() {
   })
 }
 
+/** 保存因子权重配置 */
+export function updateFactorWeights(data) {
+  return request({
+    url: '/stock/multi-factor/weights',
+    method: 'put',
+    data
+  })
+}
+
 /** 入选股票加入股票池 */
 export function addMultiFactorToPool(data) {
   return request({

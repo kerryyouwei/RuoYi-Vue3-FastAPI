@@ -18,10 +18,13 @@ from module_stock.entity.do.multi_factor_do import MultiFactorResult
 from module_stock.entity.vo.multi_factor_vo import (
     MultiFactorBatchInfoModel,
     MultiFactorCalcResultModel,
+    MultiFactorFactorWeightModel,
     MultiFactorPoolAddRequestModel,
     MultiFactorPoolAddResultModel,
     MultiFactorResultQueryModel,
     MultiFactorResultModel,
+    MultiFactorWeightSaveRequestModel,
+    MultiFactorWeightSettingsModel,
 )
 from module_stock.service.baostock_data_service import BaostockDataService
 from utils.log_util import logger
@@ -47,9 +50,6 @@ _DEFAULT_WEIGHTS = {
     'northbound': 10.0,
     'industry': 15.0,
 }
-
-# 入选分数阈值
-SELECTED_THRESHOLD = 90.0
 
 
 def _percentile_score(series: pd.Series, reverse: bool = False) -> pd.Series:
@@ -163,6 +163,10 @@ class MultiFactorService:
         batch_id = uuid.uuid4().hex[:32]
         degraded_factors: list[str] = []
 
+        # 0. 读取权重和入选阈值快照，避免长任务执行期间配置变化影响同一批次。
+        weights = await cls._get_effective_weights(db)
+        selected_threshold = await MultiFactorDao.get_selected_threshold(db)
+
         # 1. 获取股票列表
         stock_list = await BaostockDataService.fetch_stock_list()
         if stock_list.empty:
@@ -253,7 +257,8 @@ class MultiFactorService:
         }
         for score_col, (value_col, reverse) in score_map.items():
             if value_col in df.columns:
-                df[score_col] = _percentile_score(df[value_col], reverse=reverse)
+                # 因子原始值缺失时使用中性分50，避免总分被NaN污染。
+                df[score_col] = _percentile_score(df[value_col], reverse=reverse).fillna(50.0)
             else:
                 df[score_col] = 50.0
 
@@ -263,32 +268,30 @@ class MultiFactorService:
         else:
             df['macd_score'] = 50.0
 
-        # 15. 获取权重配置
-        weights = dict(_DEFAULT_WEIGHTS)
-        try:
-            config_rows = await MultiFactorDao.get_weights(db)
-            for row in config_rows:
-                weights[row.factor_name] = float(row.factor_weight)
-        except Exception:
-            pass
-
         # 16. 北向降级处理
         if 'northbound' in degraded_factors:
             df['northbound_score'] = 50.0
 
         # 17. 计算总分
+        score_columns = [
+            'roe_score', 'peg_score', 'profit_growth_score', 'volume_score',
+            'macd_score', 'northbound_score', 'industry_score',
+        ]
+        for col in score_columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(50.0)
+
         df['total_score'] = (
-            df['roe_score'] * weights.get('roe', 22.5) / 100
-            + df['peg_score'] * weights.get('peg', 15) / 100
-            + df['profit_growth_score'] * weights.get('profit_growth', 17.5) / 100
-            + df['volume_score'] * weights.get('volume', 10) / 100
-            + df['macd_score'] * weights.get('macd', 10) / 100
-            + df['northbound_score'] * weights.get('northbound', 10) / 100
-            + df['industry_score'] * weights.get('industry', 15) / 100
-        ).round(2)
+            df['roe_score'] * weights['roe'] / 100
+            + df['peg_score'] * weights['peg'] / 100
+            + df['profit_growth_score'] * weights['profit_growth'] / 100
+            + df['volume_score'] * weights['volume'] / 100
+            + df['macd_score'] * weights['macd'] / 100
+            + df['northbound_score'] * weights['northbound'] / 100
+            + df['industry_score'] * weights['industry'] / 100
+        ).fillna(50.0).round(2)
 
         # 18. 标记入选
-        df['selected'] = (df['total_score'] >= SELECTED_THRESHOLD).astype(int)
+        df['selected'] = (df['total_score'] >= selected_threshold).astype(int)
         df['factor_degraded'] = ','.join(degraded_factors) if degraded_factors else None
         df['batch_id'] = batch_id
         df['calc_date'] = date.today()
@@ -309,7 +312,7 @@ class MultiFactorService:
             record = MultiFactorResult(
                 batch_id=batch_id,
                 code=str(row['pure_code'])[:6],
-                name=row.get('name'),
+                name=_safe_str(row.get('name')),
                 total_score=float(row.get('total_score', 0)),
                 roe_score=_safe_float(row.get('roe_score')),
                 peg_score=_safe_float(row.get('peg_score')),
@@ -318,16 +321,16 @@ class MultiFactorService:
                 macd_score=_safe_float(row.get('macd_score')),
                 northbound_score=_safe_float(row.get('northbound_score')),
                 industry_score=_safe_float(row.get('industry_score')),
-                roe_value=_safe_float(row.get('roe_value')),
-                peg_value=_safe_float(row.get('peg_value')),
-                profit_growth_value=_safe_float(row.get('profit_growth_value')),
-                turnover_rate_value=_safe_float(row.get('turnover_rate_value')),
-                macd_signal=row.get('macd_signal'),
-                northbound_net=_safe_float(row.get('northbound_net')),
-                industry_name=row.get('industry_name'),
-                industry_growth=_safe_float(row.get('industry_growth')),
+                roe_value=_safe_float(row.get('roe_value'), _DECIMAL_10_4_MAX_ABS, 4),
+                peg_value=_safe_float(row.get('peg_value'), _DECIMAL_10_4_MAX_ABS, 4),
+                profit_growth_value=_safe_float(row.get('profit_growth_value'), _DECIMAL_10_4_MAX_ABS, 4),
+                turnover_rate_value=_safe_float(row.get('turnover_rate_value'), _DECIMAL_10_4_MAX_ABS, 4),
+                macd_signal=_safe_str(row.get('macd_signal')),
+                northbound_net=_safe_float(row.get('northbound_net'), 99999999999999.99, 2),
+                industry_name=_safe_str(row.get('industry_name')),
+                industry_growth=_safe_float(row.get('industry_growth'), _DECIMAL_10_4_MAX_ABS, 4),
                 selected=int(row.get('selected', 0)),
-                factor_degraded=row.get('factor_degraded'),
+                factor_degraded=_safe_str(row.get('factor_degraded')),
                 calc_date=date.today(),
             )
             records.append(record)
@@ -457,9 +460,20 @@ class MultiFactorService:
             if not batch_id:
                 raise ServiceException(message='没有可用的计算结果，请先执行计算')
 
-        results = await MultiFactorDao.get_selected_results(db, batch_id)
+        selected_threshold = await MultiFactorDao.get_selected_threshold(db)
+
+        selected_codes: list[str] | None = None
+        if request.codes is not None:
+            selected_codes = list(dict.fromkeys(code.strip() for code in request.codes))
+            invalid_codes = [code for code in selected_codes if len(code) != 6 or not code.isdigit()]
+            if invalid_codes:
+                raise ServiceException(message=f'股票代码格式错误: {",".join(invalid_codes[:10])}')
+
+        results = await MultiFactorDao.get_selected_results(db, batch_id, selected_codes)
         if not results:
-            raise ServiceException(message='该批次没有入选股票（>=90分）')
+            if selected_codes is not None:
+                raise ServiceException(message='所选股票中没有当前批次的入选股票')
+            raise ServiceException(message=f'该批次没有入选股票（>={selected_threshold:g}分）')
 
         added_count = 0
         skipped_count = 0
@@ -488,29 +502,100 @@ class MultiFactorService:
         )
 
     @classmethod
-    async def get_factor_weights(cls, db: AsyncSession) -> list[dict]:
-        """获取因子权重配置（用于前端展示）。"""
-        weights = dict(_DEFAULT_WEIGHTS)
-        try:
-            config_rows = await MultiFactorDao.get_weights(db)
-            for row in config_rows:
-                weights[row.factor_name] = float(row.factor_weight)
-        except Exception:
-            pass
-        return [
-            {'factor_name': name, 'factor_label': FACTOR_LABELS.get(name, name), 'weight': weight, 'enabled': True}
-            for name, weight in weights.items()
-        ]
+    async def _get_weight_config_map(cls, db: AsyncSession) -> dict[str, dict]:
+        """获取全部因子配置；缺失的因子使用默认配置。"""
+        config_map = {
+            name: {'weight': float(weight), 'enabled': True}
+            for name, weight in _DEFAULT_WEIGHTS.items()
+        }
+        config_rows = await MultiFactorDao.get_all_weights(db)
+        for row in config_rows:
+            if row.factor_name not in config_map:
+                continue
+            config_map[row.factor_name] = {
+                'weight': float(row.factor_weight),
+                'enabled': bool(row.enabled),
+            }
+        return config_map
+
+    @classmethod
+    async def _get_effective_weights(cls, db: AsyncSession) -> dict[str, float]:
+        """获取计算用权重；禁用因子权重为0。"""
+        config_map = await cls._get_weight_config_map(db)
+        return {
+            name: float(config['weight']) if config['enabled'] else 0.0
+            for name, config in config_map.items()
+        }
+
+    @classmethod
+    async def get_calc_settings(cls, db: AsyncSession) -> MultiFactorWeightSettingsModel:
+        """获取多因子计算配置（因子权重和入选阈值）。"""
+        config_map = await cls._get_weight_config_map(db)
+        selected_threshold = await MultiFactorDao.get_selected_threshold(db)
+        return MultiFactorWeightSettingsModel(
+            selected_threshold=selected_threshold,
+            weights=[
+                MultiFactorFactorWeightModel(
+                    factor_name=name,
+                    factor_label=FACTOR_LABELS.get(name, name),
+                    weight=config['weight'],
+                    enabled=config['enabled'],
+                )
+                for name, config in config_map.items()
+            ],
+        )
+
+    @classmethod
+    async def update_calc_settings(cls, db: AsyncSession, request: MultiFactorWeightSaveRequestModel) -> MultiFactorWeightSettingsModel:
+        """保存前端提交的因子权重和入选阈值。"""
+        valid_names = set(FACTOR_LABELS)
+        submitted_names = {item.factor_name for item in request.weights}
+        if len(request.weights) != len(valid_names) or submitted_names != valid_names:
+            raise ServiceException(message='因子权重配置不完整或包含未知因子')
+
+        enabled_total = round(sum(
+            round(float(item.weight), 2)
+            for item in request.weights
+            if item.enabled
+        ), 2)
+        if abs(enabled_total - 100.0) > 0.01:
+            raise ServiceException(message=f'启用因子权重合计必须为100%，当前为{enabled_total}%')
+
+        await MultiFactorDao.update_weights(db, request.weights)
+        await MultiFactorDao.update_selected_threshold(db, request.selected_threshold)
+        await db.commit()
+        return await cls.get_calc_settings(db)
 
 
-def _safe_float(value) -> float | None:
-    """安全转换为float或None。"""
+# decimal(10,4) 可安全入库的最大绝对值（预留四舍五入空间）。
+_DECIMAL_10_4_MAX_ABS = 999999.9994
+
+
+def _safe_str(value) -> str | None:
+    """安全转换为str或None，避免pandas的NaN进入MySQL字符串字段。"""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    value = str(value).strip()
+    return value or None
+
+
+def _safe_float(value, max_abs: float | None = None, decimals: int | None = None) -> float | None:
+    """安全转换为float或None，并按MySQL decimal字段精度处理。"""
     if value is None:
         return None
     try:
         result = float(value)
         if np.isnan(result) or np.isinf(result):
             return None
+        if max_abs is not None and abs(result) > max_abs:
+            return None
+        if decimals is not None:
+            result = round(result, decimals)
         return result
     except (ValueError, TypeError):
         return None

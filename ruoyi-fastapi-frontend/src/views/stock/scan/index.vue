@@ -12,7 +12,7 @@
         <el-row :gutter="16">
           <el-col :xs="24" :sm="12" :lg="8">
             <el-form-item label="策略" prop="strategyName">
-              <el-select v-model="form.strategyName" filterable placeholder="请选择回测策略" class="w-full">
+              <el-select v-model="form.strategyName" filterable placeholder="请选择回测策略" class="w-full" @change="loadStrategyParameters">
                 <el-option
                   v-for="item in strategies"
                   :key="item.name"
@@ -20,6 +20,31 @@
                   :value="item.name"
                 />
               </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col
+            v-for="parameter in strategyParameters"
+            :key="parameter.name"
+            :xs="24"
+            :sm="12"
+            :lg="8"
+          >
+            <el-form-item :label="parameterLabel(parameter.name)">
+              <el-switch
+                v-if="parameter.type === 'bool'"
+                v-model="form.strategyParams[parameter.name]"
+              />
+              <el-input-number
+                v-else-if="['int', 'float'].includes(parameter.type)"
+                v-model="form.strategyParams[parameter.name]"
+                :precision="parameter.type === 'int' ? 0 : 4"
+                class="w-full"
+                :controls="false"
+              />
+              <el-input
+                v-else
+                v-model="form.strategyParams[parameter.name]"
+              />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="12" :lg="8">
@@ -168,13 +193,14 @@
 
 <script setup name="StockScan">
 import { getScan, getScanItems, pickToPaper, runScan } from '@/api/system/stockScan'
-import { listStrategies } from '@/api/system/strategy'
+import { getStrategy, listStrategies } from '@/api/system/strategy'
 import { listStockPoolNames } from '@/api/system/stockSelector'
 
 const { proxy } = getCurrentInstance()
 const runFormRef = ref(null)
 const tableRef = ref(null)
 const strategies = ref([])
+const strategyParameters = ref([])
 const poolNames = ref([])
 const submitting = ref(false)
 const loading = ref(false)
@@ -203,7 +229,7 @@ const DEFAULT_QUERY = {
   order: 'desc'
 }
 
-const form = reactive({ ...DEFAULT_FORM })
+const form = reactive({ ...DEFAULT_FORM, strategyParams: {} })
 const query = reactive({ ...DEFAULT_QUERY })
 
 const rules = {
@@ -216,11 +242,48 @@ const statusLabel = status => ({ pending: '待处理', running: '运行中', suc
 const statusType = status => ({ pending: 'info', running: 'warning', success: 'success', failed: 'danger' }[status] || 'info')
 const rate = value => (value == null ? '—' : `${(value * 100).toFixed(2)}%`)
 const fixed = (value, precision) => (value == null || !Number.isFinite(Number(value)) ? '—' : Number(value).toFixed(precision))
+const parameterLabels = {
+  trade_size: '每笔数量',
+  all_in: '全部买入',
+  fast_period: '快速周期',
+  slow_period: '慢速周期',
+  short_period: '短周期',
+  long_period: '长周期',
+  period: '周期',
+  oversold: '超卖阈值',
+  overbought: '超买阈值',
+  entry_period: '入场周期',
+  exit_period: '退出周期',
+  ma_period: '均线周期',
+  breakout_ratio: '突破比例',
+  max_trade_count: '最大买卖次数',
+  signal_period: '信号周期',
+  regime_ma_period: '趋势均线周期',
+  risk_free_rate: '无风险利率'
+}
+const parameterLabel = name => parameterLabels[name] || name
 
 function loadStrategies() {
   listStrategies({}).then(response => {
     strategies.value = response.data || []
   })
+}
+
+async function loadStrategyParameters(strategyName) {
+  if (!strategyName) {
+    strategyParameters.value = []
+    form.strategyParams = {}
+    return
+  }
+  try {
+    const response = await getStrategy(strategyName)
+    const parameters = response.data?.parameters || []
+    strategyParameters.value = parameters
+    form.strategyParams = Object.fromEntries(parameters.map(item => [item.name, item.default]))
+  } catch {
+    strategyParameters.value = []
+    form.strategyParams = {}
+  }
 }
 
 function loadPoolNames() {
@@ -246,7 +309,7 @@ function handleRun() {
       commissionRate: form.commissionRate,
       stampTaxRate: form.stampTaxRate,
       benchmarkCode: form.benchmarkCode || undefined,
-      strategyParams: {}
+      strategyParams: { ...form.strategyParams }
     }
     runScan(payload).then(response => {
       const batchId = response.data?.batchId
@@ -326,6 +389,8 @@ async function handlePick() {
 function resetForm() {
   Object.assign(form, DEFAULT_FORM)
   form.dates = []
+  form.strategyParams = {}
+  strategyParameters.value = []
   proxy.resetForm('runFormRef')
 }
 

@@ -20,7 +20,7 @@ create table if not exists multi_factor_result (
   northbound_net decimal(16,2) null comment '北向持仓变化值(万元)',
   industry_name varchar(50) null comment '所属行业',
   industry_growth decimal(10,4) null comment '行业营收增速',
-  selected tinyint not null default 0 comment '是否入选(>=90分)',
+  selected tinyint not null default 0 comment '是否入选(按配置阈值)',
   factor_degraded varchar(255) null comment '降级因子说明',
   calc_date date not null comment '计算日期',
   create_time datetime(3) null comment '创建时间',
@@ -52,6 +52,22 @@ insert into multi_factor_config (factor_name, factor_weight, enabled, create_tim
   ('northbound', 10.00, 1, current_timestamp),
   ('industry', 15.00, 1, current_timestamp)
 on duplicate key update factor_weight = values(factor_weight);
+
+-- 初始化多因子入选分数阈值
+insert into sys_config (
+    config_name, config_key, config_value, config_type, remark
+)
+select
+    '多因子入选分数阈值',
+    'stock.multiFactor.selected_threshold',
+    '90.00',
+    'Y',
+    '多因子选股入选总分阈值'
+from dual
+where not exists (
+    select 1 from sys_config
+    where config_key = 'stock.multiFactor.selected_threshold'
+);
 
 -- 股票管理 > 多因子选股菜单
 insert into sys_menu (

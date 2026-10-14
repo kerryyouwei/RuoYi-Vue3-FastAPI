@@ -120,6 +120,8 @@ class BaostockDataService:
             | df['code'].str.startswith('sz.0')
             | df['code'].str.startswith('sz.3')
         )
+        # 排除深市指数：399xxx会被sz.0/sz.3前缀误匹配。
+        mask &= ~df['code'].str.startswith('sz.399')
         df = df[mask].copy()
         df['pure_code'] = df['code'].str.split('.').str[1]
 
@@ -171,10 +173,18 @@ class BaostockDataService:
             all_records.extend(db_records)
             logger.info(f'K线缓存命中: {len(db_records)} 条')
 
-        # 4. 增量拉取缺失部分
+        # 4. 增量拉取缺失部分；先探测当日K线是否已发布，避免假日/收盘前发起全市场逐只请求
         if codes_need_fetch:
-            logger.info(f'K线需要增量拉取: {len(codes_need_fetch)} 只股票')
-            new_records = await cls._fetch_kline_incremental(db, codes_need_fetch, days)
+            new_records: list[MultiFactorKlineCache] = []
+            target_day = _last_trading_day()
+            if not await cls._has_daily_kline_for_date(codes, target_day):
+                logger.warning(
+                    f'当日K线未发布或不可用，跳过全市场增量拉取: '
+                    f'target={target_day}, pending={len(codes_need_fetch)}'
+                )
+            else:
+                logger.info(f'K线需要增量拉取: {len(codes_need_fetch)} 只股票')
+                new_records = await cls._fetch_kline_incremental(db, codes_need_fetch, days)
             all_records.extend(new_records)
             # 写入DB
             if new_records:
@@ -183,6 +193,48 @@ class BaostockDataService:
 
         # 5. 转为 DataFrame
         return cls._kline_records_to_df(all_records)
+
+    @classmethod
+    async def _has_daily_kline_for_date(cls, codes: list[str], target_day: str) -> bool:
+        """探测目标交易日的日K线是否已发布。
+
+        Baostock未提供批量查询接口，这里只查询代表性大市值股票；
+        探测失败或无目标日数据时返回False，让本次计算继续使用本地缓存。
+        """
+        if not codes:
+            return False
+
+        preferred_probe_codes = ('sh.600519', 'sh.600000', 'sz.000001')
+        probe_code = next((code for code in preferred_probe_codes if code in codes), codes[0])
+
+        await _ensure_login()
+        import baostock as bs
+
+        def _query_probe(code: str):
+            rs = bs.query_history_k_data_plus(
+                code,
+                'date,code',
+                start_date=target_day,
+                end_date=target_day,
+                frequency='d',
+                adjustflag='2',
+            )
+            return _bs_query_to_df(rs)
+
+        try:
+            df = await asyncio.to_thread(_query_probe, probe_code)
+            has_data = not df.empty and any(
+                str(value)[:10] == target_day
+                for value in df.get('date', pd.Series(dtype=str))
+            )
+            if has_data:
+                logger.info(f'当日K线发布探测通过: target={target_day}, probe={probe_code}')
+            else:
+                logger.info(f'当日K线发布探测无数据: target={target_day}, probe={probe_code}')
+            return has_data
+        except Exception as exc:
+            logger.warning(f'当日K线发布探测失败 probe={probe_code}: {exc}')
+            return False
 
     @classmethod
     async def _fetch_kline_incremental(
@@ -376,12 +428,18 @@ class BaostockDataService:
             data.append({
                 'code': r.code,
                 'pure_code': r.pure_code,
+                'year': r.year,
+                'quarter': r.quarter,
                 'roeAvg': float(r.roe_avg) if r.roe_avg is not None else None,
                 'npMargin': float(r.np_margin) if r.np_margin is not None else None,
                 'YOYNI': float(r.yoy_ni) if r.yoy_ni is not None else None,
                 'YOYEquity': float(r.yoy_equity) if r.yoy_equity is not None else None,
             })
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+        # Same stock may have multiple cached quarters; factor calculation uses the latest available quarter.
+        df = df.sort_values(['pure_code', 'year', 'quarter'], kind='mergesort')
+        df = df.drop_duplicates('pure_code', keep='last')
+        return df.drop(columns=['year', 'quarter'])
 
     # ============ 行业分类（带DB缓存，7天刷新） ============
 

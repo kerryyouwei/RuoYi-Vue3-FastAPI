@@ -20,7 +20,7 @@ class MultiFactorCalcResultModel(MultiFactorBaseModel):
 
     batch_id: str = Field(description='批次ID')
     total_count: int = Field(default=0, ge=0, description='参与计算股票总数')
-    selected_count: int = Field(default=0, ge=0, description='入选股票数(>=90分)')
+    selected_count: int = Field(default=0, ge=0, description='入选股票数(按配置阈值)')
     degraded_factors: list[str] = Field(default_factory=list, description='降级因子列表')
     calc_date: date | None = Field(default=None, description='计算日期')
     elapsed_seconds: float = Field(default=0, ge=0, description='计算耗时(秒)')
@@ -82,6 +82,12 @@ class MultiFactorPoolAddRequestModel(MultiFactorBaseModel):
 
     pool_name: str = Field(default='default', min_length=1, max_length=64, description='股票池名称')
     batch_id: str | None = Field(default=None, max_length=32, description='批次ID，不传则用最新')
+    codes: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=5000,
+        description='要加入的入选股票代码；不传则加入全部入选股票',
+    )
 
     class Config:
         alias_generator = to_camel
@@ -104,3 +110,29 @@ class MultiFactorFactorWeightModel(MultiFactorBaseModel):
     factor_label: str = Field(description='因子中文标签')
     weight: float = Field(description='权重百分比')
     enabled: bool = Field(default=True, description='是否启用')
+
+
+class MultiFactorWeightSaveItemModel(MultiFactorBaseModel):
+    """因子权重保存项。"""
+
+    factor_name: str = Field(min_length=1, max_length=32, description='因子名称')
+    weight: float = Field(ge=0, le=100, description='权重百分比')
+    enabled: bool = Field(default=True, description='是否启用')
+
+
+class MultiFactorWeightSettingsModel(MultiFactorBaseModel):
+    """多因子选股配置。"""
+
+    selected_threshold: float = Field(ge=0, le=100, description='入选分数阈值')
+    weights: list[MultiFactorFactorWeightModel] = Field(description='因子权重列表')
+
+
+class MultiFactorWeightSaveRequestModel(MultiFactorBaseModel):
+    """多因子选股配置保存请求。"""
+
+    selected_threshold: float = Field(ge=0, le=100, description='入选分数阈值')
+    weights: list[MultiFactorWeightSaveItemModel] = Field(
+        min_length=1,
+        max_length=20,
+        description='因子权重列表',
+    )

@@ -70,7 +70,7 @@ class StockPaperService:
 
     @staticmethod
     def _latest_price_from_realtime(code: str, on_date: str | None = None) -> float | None:
-        """优先读取 QUANTAXIS stock_realtime 已采集的最新价。"""
+        """优先读取 QUANTAXIS stock_realtime 当日已采集的最新价。"""
         try:
             import QUANTAXIS as QA  # noqa: PLC0415
         except Exception:
@@ -79,7 +79,7 @@ class StockPaperService:
             collection = QA.DATABASE.stock_realtime
             query: dict[str, Any] = {'code': code}
             if on_date:
-                query['date'] = {'$lte': on_date}
+                query['date'] = {'$eq': on_date}
             cursor = collection.find(query, {'_id': 0, 'price': 1, 'date': 1}).sort('date', -1).limit(1)
             documents = list(cursor)
             if documents:
@@ -150,7 +150,7 @@ class StockPaperService:
 
     @staticmethod
     def _fetch_close(code: str, end_date: str) -> float | None:
-        """收盘价：优先已采集实时快照，退化QA最新日线。"""
+        """收盘价：优先当日实时快照，否则退化QA最新日线。"""
         price = StockPaperService._latest_price_from_realtime(code, end_date)
         if price is not None and price > 0:
             return price

@@ -15,6 +15,8 @@ from module_stock.entity.vo.multi_factor_vo import (
     MultiFactorPoolAddResultModel,
     MultiFactorResultQueryModel,
     MultiFactorResultModel,
+    MultiFactorWeightSaveRequestModel,
+    MultiFactorWeightSettingsModel,
 )
 from module_stock.service.multi_factor_service import MultiFactorService
 from utils.log_util import logger
@@ -80,23 +82,39 @@ async def get_latest_batch(
 
 @multi_factor_controller.get(
     '/weights',
-    summary='查询因子权重配置',
-    description='获取当前7个因子的权重配置',
-    response_model=DataResponseModel[list[dict]],
+    summary='查询多因子计算配置',
+    description='获取当前7个因子的权重配置和入选分数阈值',
+    response_model=DataResponseModel[MultiFactorWeightSettingsModel],
     dependencies=[UserInterfaceAuthDependency('stock:multiFactor:list')],
 )
 async def get_factor_weights(
     request: Request,
     db: Annotated[AsyncSession, DBSessionDependency()],
 ) -> Response:
-    result = await MultiFactorService.get_factor_weights(db)
+    result = await MultiFactorService.get_calc_settings(db)
     return ResponseUtil.success(data=result)
+
+
+@multi_factor_controller.put(
+    '/weights',
+    summary='保存多因子计算配置',
+    description='保存因子权重和入选分数阈值，启用因子权重合计必须为100%',
+    response_model=DataResponseModel[MultiFactorWeightSettingsModel],
+    dependencies=[UserInterfaceAuthDependency('stock:multiFactor:calculate')],
+)
+async def update_factor_weights(
+    request: Request,
+    body: MultiFactorWeightSaveRequestModel,
+    db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await MultiFactorService.update_calc_settings(db, body)
+    return ResponseUtil.success(data=result, msg='计算配置已保存')
 
 
 @multi_factor_controller.post(
     '/pool/add',
     summary='入选股票加入股票池',
-    description='将最新批次入选(>=90分)的股票批量加入指定股票池',
+    description='将最新批次按配置阈值入选的股票批量加入指定股票池，支持指定股票代码',
     response_model=DataResponseModel[MultiFactorPoolAddResultModel],
     dependencies=[UserInterfaceAuthDependency('stock:multiFactor:poolAdd')],
 )
