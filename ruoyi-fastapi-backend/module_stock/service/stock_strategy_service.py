@@ -17,8 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import DataSourceRegistry
 from exceptions.exception import ServiceException
+from module_stock.dao.stock_pool_dao import StockPoolDao
 from module_stock.dao.stock_strategy_dao import StockStrategyDao
-from module_stock.entity.do.stock_strategy_do import StockStrategyRun
+from module_stock.entity.do.stock_strategy_do import StockStrategyRun, StockStrategyValidation
 from module_stock.entity.vo.stock_day_vo import StockDayImportModel
 from module_stock.entity.vo.stock_strategy_vo import (
     StrategyDetailModel,
@@ -27,6 +28,9 @@ from module_stock.entity.vo.stock_strategy_vo import (
     StrategyRunDetailModel,
     StrategyRunRequest,
     StrategyRunStatusModel,
+    StrategyValidateRequest,
+    StrategyValidationModel,
+    StrategyValidationQueryModel,
 )
 from module_stock.service.stock_day_service import StockDayService
 from utils.log_util import logger
@@ -66,7 +70,7 @@ class StockStrategyService:
         for node in tree.body:
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id in {'DISPLAY_NAME', 'CATEGORY', 'DESCRIPTION'}:
+                    if isinstance(target, ast.Name) and target.id in {'DISPLAY_NAME', 'CATEGORY', 'DESCRIPTION', 'IS_PORTFOLIO'}:
                         try:
                             values[target.id] = ast.literal_eval(node.value)
                         except (ValueError, TypeError):
@@ -81,6 +85,7 @@ class StockStrategyService:
             'category': str(values.get('CATEGORY', 'code')),
             'description': str(docstring).splitlines()[0],
             'modified_time': datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec='seconds'),
+            'is_portfolio': bool(values.get('IS_PORTFOLIO', False)),
             'source_code': source,
         }
 
@@ -100,7 +105,7 @@ class StockStrategyService:
             summary = (last.summary or {}) if last else {}
             result.append(
                 StrategyListModel(
-                    **{key: metadata[key] for key in ('name', 'display_name', 'category', 'description', 'modified_time')},
+                    **{key: metadata[key] for key in ('name', 'display_name', 'category', 'description', 'modified_time', 'is_portfolio')},
                     run_count=stat.get('run_count', 0),
                     last_run_time=last.create_time.isoformat() if last and last.create_time else None,
                     last_return_rate=summary.get('returnRate'),
@@ -168,6 +173,15 @@ class StockStrategyService:
             request.strategy_name,
             request.strategy_params,
         )
+        metadata = cls._metadata(cls._file(request.strategy_name))
+        if request.pool_name and not metadata.get('is_portfolio'):
+            raise ServiceException(message='该策略不是组合策略，请勿指定股票池')
+        pool_codes = None
+        if request.pool_name:
+            pool_items = await StockPoolDao.codes_by_pool(db, request.pool_name)
+            if not pool_items:
+                raise ServiceException(message=f'股票池「{request.pool_name}」不存在或为空')
+            pool_codes = [code for code, _name in pool_items]
         run_id = str(uuid.uuid4())
         await StockStrategyDao.create(
             db,
@@ -181,6 +195,8 @@ class StockStrategyService:
                 commission_rate=str(request.commission_rate),
                 stamp_tax_rate=str(request.stamp_tax_rate),
                 benchmark_code=request.benchmark_code,
+                pool_name=request.pool_name,
+                pool_codes=pool_codes,
                 strategy_params=strategy_params,
                 status='pending',
                 progress=0,
@@ -195,6 +211,7 @@ class StockStrategyService:
             end_date=request.end.isoformat(),
             initial_cash=request.initial_cash,
             benchmark_code=request.benchmark_code,
+            pool_name=request.pool_name,
             strategy_params=strategy_params,
         ).info('股票策略回测已提交')
         task = asyncio.create_task(cls._execute_run(run_id), name=f'stock-strategy-{run_id}')
@@ -237,6 +254,7 @@ class StockStrategyService:
                 float(run.stamp_tax_rate),
                 run.benchmark_code,
                 run.strategy_params,
+                pool_codes=run.pool_codes,
             )
             logger.bind(run_id=run_id).info('股票策略回测结果已生成，准备写入数据库')
             async with DataSourceRegistry.session(log_sql=False) as db:
@@ -350,6 +368,7 @@ class StockStrategyService:
         stamp_tax_rate: float,
         benchmark_code: str | None,
         strategy_params: dict[str, Any] | None,
+        pool_codes: list[str] | None = None,
     ) -> dict[str, Any]:
         """对单只标的执行一次 Backtrader 回测，返回 summary/curves/trades/run_logs。"""
         try:
@@ -397,21 +416,27 @@ class StockStrategyService:
             cerebro = bt.Cerebro()
             cerebro.adddata(bt.feeds.PandasData(dataname=data), name=code)
 
-            # 组合策略可以通过 UNIVERSE 声明多个标的；主时钟标的本身不要重复加入。
-            universe = [
-                universe_code for universe_code in (getattr(strategy_cls, 'UNIVERSE', None) or [])
-                if universe_code != code
-            ]
+            # 组合策略优先使用股票池快照，其次回退到策略内静态 UNIVERSE；主时钟本身不重复加入。
+            universe = [item for item in (pool_codes or getattr(strategy_cls, 'UNIVERSE', None) or []) if item != code]
+            skipped_universe: list[dict[str, str]] = []
             for universe_code in universe:
                 universe_data = cls._load_stock_data(universe_code, data_start_date, end_date)
                 if universe_data is None:
+                    skipped_universe.append({'code': universe_code, 'reason': '无日线数据'})
                     logger.bind(universe_code=universe_code).warning('组合策略标的未加载到数据，已跳过')
                     continue
                 cerebro.adddata(
                     bt.feeds.PandasData(dataname=universe_data),
                     name=universe_code,
                 )
-            logger.bind(feeds=len(cerebro.datas), code=code).info('组合策略行情数据加载完成')
+            if universe and len(cerebro.datas) <= 1:
+                raise RuntimeError('股票池内没有任何标的加载到行情数据，请先导入日线数据')
+            universe_info = {
+                'requestedCount': len(universe),
+                'availableCount': len(universe) - len(skipped_universe),
+                'skipped': skipped_universe,
+            }
+            logger.bind(feeds=len(cerebro.datas), code=code, universe_info=universe_info).info('组合策略行情数据加载完成')
 
             cerebro.addstrategy(
                 cls._live_start_strategy(strategy_cls, signal_start_date),
@@ -502,6 +527,7 @@ class StockStrategyService:
             'tradeCount': closed,
             'initialCash': float(start_value),
             'endingValue': float(end_value),
+            'universeInfo': universe_info if universe else None,
         }
         strategy_returns = [round(item / start_value - 1, 6) for item in equity]
         peak = -math.inf
@@ -526,6 +552,175 @@ class StockStrategyService:
             if record.get('date', '') >= str(start_date)[:10]
         ]
         return {'summary': summary, 'curves': curves, 'trades': trades, 'run_logs': logs.getvalue().splitlines()}
+
+    # ---------------------------------------------------------------- rolling validation
+
+    @classmethod
+    async def validate(cls, db: AsyncSession, request: StrategyValidateRequest) -> str:
+        cls._file(request.strategy_name)
+        metadata = cls._metadata(cls._file(request.strategy_name))
+        if not metadata.get('is_portfolio'):
+            raise ServiceException(message='滚动验证仅支持组合策略')
+        strategy_params = await asyncio.to_thread(
+            cls._coerce_strategy_params,
+            request.strategy_name,
+            request.strategy_params,
+        )
+        pool_items = await StockPoolDao.codes_by_pool(db, request.pool_name)
+        if not pool_items:
+            raise ServiceException(message=f'股票池「{request.pool_name}」不存在或为空')
+        pool_codes = [code for code, _name in pool_items]
+        validation_id = str(uuid.uuid4())
+        await StockStrategyDao.create_validation(
+            db,
+            StockStrategyValidation(
+                validation_id=validation_id,
+                strategy_name=request.strategy_name,
+                code=request.code,
+                start_date=request.start.isoformat(),
+                end_date=request.end.isoformat(),
+                initial_cash=request.initial_cash,
+                commission_rate=str(request.commission_rate),
+                stamp_tax_rate=str(request.stamp_tax_rate),
+                benchmark_code=request.benchmark_code,
+                strategy_params=strategy_params,
+                pool_name=request.pool_name,
+                pool_codes=pool_codes,
+                status='pending',
+                progress=0,
+            ),
+        )
+        await db.commit()
+        logger.bind(
+            validation_id=validation_id,
+            strategy_name=request.strategy_name,
+            pool_name=request.pool_name,
+            pool_size=len(pool_codes),
+        ).info('滚动验证已提交')
+        task = asyncio.create_task(cls._execute_validation(validation_id), name=f'stock-strategy-validation-{validation_id}')
+        _RUNNING_TASKS.add(task)
+        task.add_done_callback(_log_task_result)
+        return validation_id
+
+    @staticmethod
+    def _validation_windows(start_date: str, end_date: str) -> list[tuple[str, str]]:
+        start = datetime.strptime(str(start_date)[:10], '%Y-%m-%d').date()
+        end = datetime.strptime(str(end_date)[:10], '%Y-%m-%d').date()
+        windows: list[tuple[str, str]] = []
+        for year in range(start.year, end.year + 1):
+            window_start = max(start, date(year, 1, 1))
+            window_end = min(end, date(year, 12, 31))
+            if (window_end - window_start).days >= 30:
+                windows.append((window_start.isoformat(), window_end.isoformat()))
+        return windows
+
+    @classmethod
+    async def _execute_validation(cls, validation_id: str) -> None:
+        logger.bind(validation_id=validation_id).info('滚动验证任务开始')
+        try:
+            async with DataSourceRegistry.session(log_sql=False) as db:
+                await StockStrategyDao.update_validation(db, validation_id, status='running', progress=5, error_message=None)
+                await db.commit()
+                validation = await StockStrategyDao.get_validation(db, validation_id)
+        except Exception:
+            logger.bind(validation_id=validation_id).exception('滚动验证加载记录失败')
+            raise
+        if validation is None:
+            logger.bind(validation_id=validation_id).error('滚动验证记录不存在，任务终止')
+            return
+        windows_spec = cls._validation_windows(validation.start_date, validation.end_date)
+        if not windows_spec:
+            await cls._fail_validation(validation_id, '验证区间不足，无法切分年度窗口')
+            return
+        windows: list[dict[str, Any]] = []
+        total = len(windows_spec)
+        for index, (window_start, window_end) in enumerate(windows_spec, start=1):
+            entry: dict[str, Any] = {
+                'label': window_start[:4],
+                'startDate': window_start,
+                'endDate': window_end,
+                'status': 'running',
+            }
+            try:
+                result = await asyncio.to_thread(
+                    cls.backtest_once,
+                    validation.strategy_name,
+                    validation.code,
+                    window_start,
+                    window_end,
+                    validation.initial_cash,
+                    float(validation.commission_rate),
+                    float(validation.stamp_tax_rate),
+                    validation.benchmark_code,
+                    validation.strategy_params,
+                    validation.pool_codes,
+                )
+                entry.update({'status': 'success', 'summary': result.get('summary') or {}})
+            except Exception as exc:
+                entry.update({'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'[:500]})
+                logger.bind(validation_id=validation_id, window=entry['label']).exception('滚动验证窗口执行失败')
+            windows.append(entry)
+            progress = 5 + round(index / total * 90)
+            async with DataSourceRegistry.session(log_sql=False) as db:
+                await StockStrategyDao.update_validation(db, validation_id, windows=windows, progress=progress)
+                await db.commit()
+        summary = cls._aggregate_validation_summary(windows, total)
+        status = 'success' if summary.get('successWindows') else 'failed'
+        async with DataSourceRegistry.session(log_sql=False) as db:
+            await StockStrategyDao.update_validation(
+                db,
+                validation_id,
+                status=status,
+                progress=100,
+                windows=windows,
+                summary=summary,
+                error_message=None if status == 'success' else '所有验证窗口均执行失败',
+            )
+            await db.commit()
+        logger.bind(validation_id=validation_id, status=status).info('滚动验证执行完成')
+
+    @staticmethod
+    def _aggregate_validation_summary(windows: list[dict[str, Any]], total: int) -> dict[str, Any]:
+        success = [item for item in windows if item.get('status') == 'success' and item.get('summary')]
+        failed = [item for item in windows if item.get('status') == 'failed']
+
+        def mean(key: str) -> float | None:
+            values = [float(item['summary'][key]) for item in success if item['summary'].get(key) is not None]
+            return round(sum(values) / len(values), 6) if values else None
+
+        combined = 1.0
+        for item in success:
+            combined *= 1 + float((item.get('summary') or {}).get('returnRate') or 0)
+        return {
+            'totalWindows': total,
+            'successWindows': len(success),
+            'failedWindows': len(failed),
+            'positiveWindows': sum(
+                1 for item in success if float((item.get('summary') or {}).get('returnRate') or 0) > 0
+            ),
+            'avgReturnRate': mean('returnRate'),
+            'avgAnnualReturn': mean('annualReturn'),
+            'avgSharpeRatio': mean('sharpeRatio'),
+            'avgMaxDrawdown': mean('maxDrawdown'),
+            'combinedReturnRate': round(combined - 1, 6) if success else None,
+        }
+
+    @staticmethod
+    async def _fail_validation(validation_id: str, message: str) -> None:
+        async with DataSourceRegistry.session(log_sql=False) as db:
+            await StockStrategyDao.update_validation(db, validation_id, status='failed', progress=100, error_message=message)
+            await db.commit()
+
+    @classmethod
+    async def validation_status(cls, db: AsyncSession, validation_id: str) -> StrategyValidationModel:
+        validation = await StockStrategyDao.get_validation(db, validation_id)
+        if validation is None:
+            raise ServiceException(message='滚动验证记录不存在')
+        return StrategyValidationModel.model_validate(validation)
+
+    @classmethod
+    async def validation_list(cls, db: AsyncSession, query: StrategyValidationQueryModel):
+        return await StockStrategyDao.list_validations(db, query)
 
     @staticmethod
     def _load_qa_daily_data(code: str, start: str, end: str, index: bool = False):
@@ -593,6 +788,7 @@ class StockStrategyService:
             commission_rate=float(run.commission_rate),
             stamp_tax_rate=float(run.stamp_tax_rate),
             benchmark_code=run.benchmark_code,
+            pool_name=getattr(run, 'pool_name', None),
             strategy_params=run.strategy_params or {},
             create_time=run.create_time,
             curves=run.curves,
@@ -618,5 +814,6 @@ class StockStrategyService:
     async def recover_orphaned_runs(cls) -> None:
         async with DataSourceRegistry.session(log_sql=False) as db:
             await StockStrategyDao.fail_orphaned(db)
+            await StockStrategyDao.fail_orphaned_validations(db)
             await db.commit()
         logger.info('股票策略遗留回测任务恢复检查完成')

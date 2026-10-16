@@ -16,8 +16,12 @@ from module_stock.entity.vo.stock_strategy_vo import (
     StrategyRunDetailModel,
     StrategyRunRequest,
     StrategyRunStatusModel,
+    StrategyValidateRequest,
+    StrategyValidationModel,
+    StrategyValidationQueryModel,
 )
 from module_stock.service.stock_strategy_service import StockStrategyService
+from utils.log_util import logger
 from utils.response_util import ResponseUtil
 
 stock_strategy_controller = APIRouterPro(
@@ -56,6 +60,53 @@ async def run_status(request: Request, run_id: Annotated[str, Path()], db: Annot
 @stock_strategy_controller.get('/run/{run_id}/detail', response_model=DataResponseModel[StrategyRunDetailModel], dependencies=[UserInterfaceAuthDependency('stock:strategy:detail')])
 async def run_detail(request: Request, run_id: Annotated[str, Path()], db: Annotated[AsyncSession, DBSessionDependency()]) -> Response:
     return ResponseUtil.success(data=await StockStrategyService.status(db, run_id, detail=True))
+
+
+@stock_strategy_controller.post(
+    '/validate',
+    summary='提交股票池滚动验证',
+    description='按自然年窗口对组合策略做滚动样本外验证，参数全程冻结',
+    response_model=DataResponseModel[dict],
+    dependencies=[UserInterfaceAuthDependency('stock:strategy:run')],
+)
+async def validate_strategy(
+    request: Request,
+    body: StrategyValidateRequest,
+    db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    validation_id = await StockStrategyService.validate(db, body)
+    logger.bind(
+        validation_id=validation_id, strategy_name=body.strategy_name, pool_name=body.pool_name
+    ).info('股票池滚动验证已提交')
+    return ResponseUtil.success(data={'validationId': validation_id}, msg='滚动验证已提交')
+
+
+@stock_strategy_controller.get(
+    '/validation',
+    summary='分页查询滚动验证历史',
+    response_model=PageResponseModel,
+    dependencies=[UserInterfaceAuthDependency('stock:strategy:detail')],
+)
+async def list_validations(
+    request: Request,
+    query: Annotated[StrategyValidationQueryModel, Query()],
+    db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    return ResponseUtil.success(model_content=await StockStrategyService.validation_list(db, query))
+
+
+@stock_strategy_controller.get(
+    '/validation/{validation_id}',
+    summary='查询滚动验证状态与结果',
+    response_model=DataResponseModel[StrategyValidationModel],
+    dependencies=[UserInterfaceAuthDependency('stock:strategy:detail')],
+)
+async def get_validation(
+    request: Request,
+    validation_id: Annotated[str, Path(max_length=36)],
+    db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    return ResponseUtil.success(data=await StockStrategyService.validation_status(db, validation_id))
 
 
 @stock_strategy_controller.get('/{strategy_name}/history', response_model=PageResponseModel, dependencies=[UserInterfaceAuthDependency('stock:strategy:detail')])

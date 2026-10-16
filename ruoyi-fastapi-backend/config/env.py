@@ -193,6 +193,22 @@ class RedisSettings(BaseSettings):
     redis_database: int = 2
 
 
+class FeishuNotifySettings(BaseSettings):
+    """
+    飞书通知配置，支持企业自建应用机器人与自定义群机器人。
+    """
+
+    feishu_notify_enabled: bool = False
+    feishu_notify_mode: Literal['app', 'webhook'] = 'app'
+    feishu_app_id: str = ''
+    feishu_app_secret: str = ''
+    feishu_chat_id: str = ''
+    feishu_receive_id_type: Literal['chat_id', 'open_id', 'union_id', 'user_id'] = 'chat_id'
+    feishu_notify_webhook_url: str = ''
+    feishu_notify_secret: str = ''
+    feishu_notify_timeout_seconds: int = 5
+
+
 class LogSettings(BaseSettings):
     """
     日志与队列配置
@@ -396,6 +412,12 @@ class GetConfig:
         # 实例化Redis配置模型
         return RedisSettings()
 
+    def get_feishu_notify_config(self) -> FeishuNotifySettings:
+        """
+        获取飞书通知配置
+        """
+        return FeishuNotifySettings()
+
     def get_log_config(self) -> LogSettings:
         """
         获取日志配置
@@ -476,6 +498,8 @@ DataBaseConfig = get_config.get_database_config()
 RedisConfig = get_config.get_redis_config()
 # 日志配置
 LogConfig = get_config.get_log_config()
+# 飞书通知配置
+FeishuNotifyConfig = get_config.get_feishu_notify_config()
 # 传输层加解密配置
 TransportCryptoConfig = get_config.get_transport_crypto_config()
 # 插件依赖安装策略配置

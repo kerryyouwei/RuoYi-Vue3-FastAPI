@@ -11,6 +11,8 @@
       <div class="action-bar">
         <el-button type="primary" icon="Bell" :loading="signalLoading" @click="handleRunSignal">手动收盘算信号</el-button>
         <el-button type="warning" icon="ShoppingCart" :loading="executeLoading" @click="handleRunExecute">手动开盘撮合</el-button>
+        <el-button type="danger" icon="Timer" :loading="realtimeLoading" @click="handleRunRealtime">手动实时轮循</el-button>
+        <el-button type="info" icon="Download" :loading="syncLoading" @click="handleRunDailySync">同步日线</el-button>
         <el-button type="success" icon="Setting" @click="openInitDialog">初始化账户</el-button>
         <el-button icon="Refresh" @click="reloadAll">刷新</el-button>
       </div>
@@ -69,6 +71,30 @@
     </el-card>
 
     <el-card shadow="never" class="mb8" v-if="account">
+      <template #header><div class="card-header"><span>标的池实时行情</span><el-tag type="info" effect="plain">每30秒自动刷新</el-tag></div></template>
+      <el-table v-loading="quotesLoading" :data="realtimeQuotes" stripe>
+        <el-table-column label="股票代码" prop="code" width="110" align="center" />
+        <el-table-column label="股票名称" prop="name" width="130" show-overflow-tooltip />
+        <el-table-column label="最新价" prop="price" width="100" align="right" />
+        <el-table-column label="快照时间" prop="snapshotTime" width="180" align="center" />
+        <el-table-column label="持仓数量" prop="quantity" width="100" align="right" />
+        <el-table-column label="成本价" prop="avgCost" width="100" align="right" />
+        <el-table-column label="浮动盈亏" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="row.unrealizedPnl !== null" :class="row.unrealizedPnl >= 0 ? 'text-success' : 'text-danger'">{{ money(row.unrealizedPnl) }}</span>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="盈亏比例" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="row.unrealizedPnlRate !== null" :class="row.unrealizedPnlRate >= 0 ? 'text-success' : 'text-danger'">{{ (row.unrealizedPnlRate * 100).toFixed(2) }}%</span>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card shadow="never" class="mb8" v-if="account">
       <template #header><div class="card-header"><span>今日信号 / 明日开盘计划</span></div></template>
       <el-table v-loading="signalsLoading" :data="signals" stripe>
         <el-table-column label="信号日期" prop="signalDate" width="110" align="center" />
@@ -87,6 +113,20 @@
             <el-tag :type="signalStatusType(row.status)">{{ signalStatusLabel(row.status) }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="飞书通知" width="110" align="center">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.signal !== '持有'"
+              link
+              type="danger"
+              :loading="recallLoadingId === row.id"
+              @click="handleRecallSignal(row)"
+            >
+              撤回
+            </el-button>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
       </el-table>
       <pagination
         v-show="signalTotal > 0"
@@ -102,6 +142,7 @@
       <el-table v-loading="ordersLoading" :data="orders" stripe>
         <el-table-column label="执行日期" prop="executeDate" width="110" align="center" />
         <el-table-column label="信号日期" prop="signalDate" width="110" align="center" />
+        <el-table-column label="成交时间" prop="tradeTime" width="90" align="center" />
         <el-table-column label="股票代码" prop="code" width="110" align="center" />
         <el-table-column label="股票名称" prop="name" width="130" show-overflow-tooltip />
         <el-table-column label="方向" prop="side" width="70" align="center">
@@ -158,7 +199,21 @@
 
 <script setup name="StockPaper">
 import * as echarts from 'echarts'
-import { getAccount, getOrders, getPositions, getSignals, getSnapshot, getUniverse, initAccount, runExecute, runSignal } from '@/api/system/stockPaper'
+import {
+  getAccount,
+  getOrders,
+  getPositions,
+  getSignals,
+  getSnapshot,
+  getRealtimeQuotes,
+  getUniverse,
+  initAccount,
+  recallSignalNotification,
+  runDailySync,
+  runExecute,
+  runRealtime,
+  runSignal,
+} from '@/api/system/stockPaper'
 import { listStrategies } from '@/api/system/strategy'
 
 const { proxy } = getCurrentInstance()
@@ -179,9 +234,16 @@ const signalsLoading = ref(false)
 const ordersLoading = ref(false)
 const signalLoading = ref(false)
 const executeLoading = ref(false)
+const realtimeLoading = ref(false)
+const recallLoadingId = ref(null)
+const syncLoading = ref(false)
+const realtimeQuotes = ref([])
+const quotesLoading = ref(false)
 const initVisible = ref(false)
 const initLoading = ref(false)
 let chart = null
+let refreshTimer = null
+let quotesTimer = null
 
 const signalQuery = reactive({ pageNum: 1, pageSize: 10 })
 const orderQuery = reactive({ pageNum: 1, pageSize: 10 })
@@ -307,6 +369,16 @@ function reloadAll() {
   })
 }
 
+function loadRealtimeQuotes() {
+  if (!account.value) return
+  quotesLoading.value = true
+  getRealtimeQuotes().then(response => {
+    realtimeQuotes.value = response.data || []
+  }).finally(() => {
+    quotesLoading.value = false
+  })
+}
+
 async function handleRunSignal() {
   signalLoading.value = true
   try {
@@ -335,6 +407,43 @@ async function handleRunExecute() {
     loadSnapshot()
   } finally {
     executeLoading.value = false
+  }
+}
+
+async function handleRunRealtime() {
+  realtimeLoading.value = true
+  try {
+    await runRealtime()
+    proxy.$modal.msgSuccess('实时轮循执行完成')
+    await loadAccount()
+    signalQuery.pageNum = 1
+    orderQuery.pageNum = 1
+    loadUniverse()
+    loadPositions()
+    loadSignals()
+    loadOrders()
+    loadSnapshot()
+  } finally {
+    realtimeLoading.value = false
+  }
+}
+
+async function handleRecallSignal(row) {
+  recallLoadingId.value = row.id
+  try {
+    await recallSignalNotification(row.id)
+    proxy.$modal.msgSuccess('飞书通知已撤回')
+  } finally {
+    recallLoadingId.value = null
+  }
+}
+async function handleRunDailySync() {
+  syncLoading.value = true
+  try {
+    await runDailySync()
+    proxy.$modal.msgSuccess('标的池日线同步完成')
+  } finally {
+    syncLoading.value = false
   }
 }
 
@@ -371,7 +480,11 @@ function handleInit() {
   })
 }
 
-onBeforeUnmount(() => chart?.dispose())
+onBeforeUnmount(() => {
+  chart?.dispose()
+  if (refreshTimer) clearInterval(refreshTimer)
+  if (quotesTimer) clearInterval(quotesTimer)
+})
 loadStrategies()
 loadAccount().then(() => {
   loadUniverse()
@@ -380,6 +493,9 @@ loadAccount().then(() => {
   loadOrders()
   loadSnapshot()
 })
+refreshTimer = setInterval(reloadAll, 60000)
+loadRealtimeQuotes()
+quotesTimer = setInterval(loadRealtimeQuotes, 30000)
 </script>
 
 <style scoped>

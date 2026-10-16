@@ -14,6 +14,9 @@ _DATE_COLUMN_CANDIDATES = ('date', 'datetime', 'trade_date')
 _PRICE_COLUMN_CANDIDATES = ('price', 'close', 'last_price', 'now')
 _PRE_CLOSE_COLUMN_CANDIDATES = ('pre_close', 'yesterday_close', 'preclose', 'last_close')
 
+TDX_HOSTS = ('shtdx.gtjas.com', 'sztdx.gtjas.com', 'jstdx.gtjas.com')
+TDX_PORT = 7709
+
 
 class StockRealtimeService:
     """
@@ -43,6 +46,89 @@ class StockRealtimeService:
         return await anyio.to_thread.run_sync(
             cls._collect_and_signal, list(codes), package, ma_period, breakout_ratio
         )
+
+    @classmethod
+    async def fetch_realtime(cls, codes: list[str]) -> list[dict[str, Any]]:
+        """
+        直连 TDX 行情服务器批量获取标准化实时行情（不依赖 QUANTAXIS 统一入口与 MongoDB 配置）
+
+        :param codes: 6位股票代码列表
+        :return: 标准化快照列表，每条含 code/price/volume/snapshot_time；全部失败时返回空列表
+        """
+        return await anyio.to_thread.run_sync(cls._fetch_realtime_sync, list(codes))
+
+    @staticmethod
+    def _fetch_realtime_sync(codes: list[str]) -> list[dict[str, Any]]:
+        """按主备顺序尝试 TDX 行情源，尽量补齐所有标的。"""
+        if not codes:
+            return []
+        try:
+            from QUANTAXIS.QAFetch.QATdx import QA_fetch_get_stock_realtime  # noqa: PLC0415
+        except ImportError as exc:
+            logger.bind(codes=codes).warning(f'未安装 QUANTAXIS，无法获取实时行情：{exc}')
+            return []
+
+        results: dict[str, dict[str, Any]] = {}
+        remaining = [str(code).strip() for code in codes if str(code).strip()]
+        for host in TDX_HOSTS:
+            if not remaining:
+                break
+            try:
+                frame = QA_fetch_get_stock_realtime(code=remaining, ip=host, port=TDX_PORT)
+            except Exception as exc:
+                logger.bind(host=host, port=TDX_PORT, remaining=remaining).warning(
+                    f'行情源 {host}:{TDX_PORT} 获取实时行情失败：{exc}'
+                )
+                continue
+            if frame is None or frame.empty:
+                logger.bind(host=host, remaining=remaining).warning(f'行情源 {host}:{TDX_PORT} 返回空行情，切换下一源')
+                continue
+
+            rows = frame.reset_index().to_dict(orient='records')
+            for row in rows:
+                record = StockRealtimeService._extract_realtime_quote(row)
+                if record is None:
+                    continue
+                if record['code'] not in remaining:
+                    continue
+                if record['price'] <= 0:
+                    logger.bind(code=record['code'], host=host).warning('实时价非正值，视为无效行情')
+                    continue
+                results[record['code']] = record
+            remaining = [code for code in remaining if code not in results]
+
+        return list(results.values())
+
+    @staticmethod
+    def _extract_realtime_quote(row: dict[str, Any]) -> dict[str, Any] | None:
+        """将 TDX 实时行情行标准化为 code/price/volume/snapshot_time。"""
+        code = str(row.get('code') or '').strip()
+        if not code:
+            return None
+        price = StockRealtimeService._clean_float(
+            StockRealtimeService._first_present(row, _PRICE_COLUMN_CANDIDATES)
+        )
+        if price is None:
+            return None
+        volume = StockRealtimeService._clean_float(
+            StockRealtimeService._first_present(row, ('volume', 'vol'))
+        )
+        snapshot_time = StockRealtimeService._first_present(row, ('datetime', 'servertime'))
+        if snapshot_time is None:
+            snapshot_time = datetime.now(TimezoneUtil.get_app_timezone()).isoformat(timespec='seconds')
+        elif isinstance(snapshot_time, datetime):
+            snapshot_time = snapshot_time.isoformat(timespec='seconds')
+        elif isinstance(snapshot_time, date_type):
+            snapshot_time = snapshot_time.isoformat()
+        else:
+            snapshot_time = str(snapshot_time).strip()
+
+        return {
+            'code': code,
+            'price': price,
+            'volume': volume if volume is not None else 0.0,
+            'snapshot_time': snapshot_time,
+        }
 
     @staticmethod
     def _collect_and_signal(

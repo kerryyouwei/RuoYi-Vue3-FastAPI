@@ -5,6 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
+_CODE_LENGTH = 6
+
 
 class StrategyBaseModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
@@ -22,6 +24,7 @@ class StrategyListModel(StrategyBaseModel):
     category: str
     description: str
     modified_time: str
+    is_portfolio: bool = False
     run_count: int = 0
     last_run_time: str | None = None
     last_return_rate: float | None = None
@@ -42,12 +45,13 @@ class StrategyRunRequest(StrategyBaseModel):
     commission_rate: float = Field(default=0.0003, ge=0, le=0.1)
     stamp_tax_rate: float = Field(default=0.001, ge=0, le=0.1)
     benchmark_code: str | None = Field(default=None, max_length=6)
+    pool_name: str | None = Field(default=None, max_length=64)
     strategy_params: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator('code', 'benchmark_code')
     @classmethod
     def validate_code(cls, value: str | None) -> str | None:
-        if value is not None and value != '' and (not value.isdigit() or len(value) != 6):
+        if value is not None and value != '' and (not value.isdigit() or len(value) != _CODE_LENGTH):
             raise ValueError('股票代码必须为6位数字')
         return value or None
 
@@ -58,6 +62,10 @@ class StrategyRunRequest(StrategyBaseModel):
         if self.start == self.end:
             raise ValueError('回测日期范围至少需要两个交易日')
         return self
+
+
+class StrategyValidateRequest(StrategyRunRequest):
+    pool_name: str = Field(min_length=1, max_length=64)
 
 
 class StrategyRunStatusModel(StrategyBaseModel):
@@ -77,6 +85,7 @@ class StrategyRunDetailModel(StrategyRunStatusModel):
     commission_rate: float
     stamp_tax_rate: float
     benchmark_code: str | None = None
+    pool_name: str | None = None
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     create_time: datetime | None = None
     curves: dict[str, Any] | None = None
@@ -85,5 +94,31 @@ class StrategyRunDetailModel(StrategyRunStatusModel):
 
 
 class StrategyHistoryQueryModel(StrategyBaseModel):
+    page_num: int = Field(default=1, ge=1)
+    page_size: int = Field(default=10, ge=1, le=100)
+
+
+class StrategyValidationModel(StrategyBaseModel):
+    validation_id: str
+    strategy_name: str
+    code: str
+    start_date: str
+    end_date: str
+    initial_cash: int
+    commission_rate: str
+    stamp_tax_rate: str
+    benchmark_code: str | None = None
+    pool_name: str | None = None
+    strategy_params: dict[str, Any] = Field(default_factory=dict)
+    status: Literal['pending', 'running', 'success', 'failed']
+    progress: int
+    error_message: str | None = None
+    windows: list[dict[str, Any]] | None = None
+    summary: dict[str, Any] | None = None
+    create_time: datetime | None = None
+
+
+class StrategyValidationQueryModel(StrategyBaseModel):
+    strategy_name: str | None = Field(default=None, max_length=64)
     page_num: int = Field(default=1, ge=1)
     page_size: int = Field(default=10, ge=1, le=100)

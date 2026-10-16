@@ -19,6 +19,7 @@ _CODE_LENGTH = 6
 # scan
 # ---------------------------------------------------------------------------
 
+
 class ScanRunRequestModel(PaperBaseModel):
     strategy_name: str = Field(min_length=1, max_length=64)
     pool_name: str = Field(min_length=1, max_length=64)
@@ -132,6 +133,7 @@ class ScanPickRequestModel(PaperBaseModel):
 # paper
 # ---------------------------------------------------------------------------
 
+
 class PaperAccountInitRequestModel(PaperBaseModel):
     account_name: str = Field(default='default', min_length=1, max_length=64)
     strategy_name: str = Field(min_length=1, max_length=64)
@@ -192,6 +194,12 @@ class PaperPositionModel(PaperBaseModel):
     pnl: float | None = None
 
 
+class PaperSignalRecallRequestModel(PaperBaseModel):
+    """撤回飞书交易信号通知请求。"""
+
+    reason: str = Field(default='信号作废，通知已撤回', min_length=1, max_length=200)
+
+
 class PaperSignalModel(PaperBaseModel):
     id: int
     account_id: int
@@ -220,6 +228,7 @@ class PaperOrderModel(PaperBaseModel):
     stamp_tax: float
     execute_status: str
     skip_reason: str | None = None
+    trade_time: str | None = None
 
 
 class PaperSnapshotModel(PaperBaseModel):
@@ -231,6 +240,17 @@ class PaperSnapshotModel(PaperBaseModel):
     position_value: float
     pnl: float | None = None
     return_rate: float | None = None
+
+
+class PaperRealtimeQuoteModel(PaperBaseModel):
+    code: str
+    name: str | None = None
+    price: float | None = None
+    snapshot_time: str | None = None
+    quantity: int = 0
+    avg_cost: float | None = None
+    unrealized_pnl: float | None = None
+    unrealized_pnl_rate: float | None = None
 
 
 class PaperPageQueryModel(PaperBaseModel):

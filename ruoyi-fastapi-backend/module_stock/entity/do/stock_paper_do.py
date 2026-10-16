@@ -3,6 +3,7 @@
 from sqlalchemy import JSON, BigInteger, Column, Float, Index, Integer, String, Text, UniqueConstraint
 
 from common.mixin import AuditTimeMixin
+from common.types import DbUtcDateTime
 from config.database import Base
 
 
@@ -25,6 +26,7 @@ class StockScanBatch(AuditTimeMixin, Base):
     stamp_tax_rate = Column(String(32), nullable=False, default='0.001', comment='卖出印花税率')
     benchmark_code = Column(String(6), nullable=True, comment='基准代码')
     strategy_params = Column(JSON, nullable=False, default=dict, comment='策略参数JSON')
+    pool_codes = Column(JSON, nullable=True, comment='股票池快照代码JSON（组合策略批次使用）')
     status = Column(String(16), nullable=False, default='pending', comment='pending/running/success/failed')
     progress = Column(BigInteger, nullable=False, default=0, comment='进度百分比')
     total_count = Column(BigInteger, nullable=False, default=0, comment='股票总数')
@@ -155,6 +157,7 @@ class StockPaperOrder(AuditTimeMixin, Base):
     stamp_tax = Column(Float, nullable=False, default=0, comment='印花税')
     execute_status = Column(String(16), nullable=False, default='成交', comment='成交/跳过')
     skip_reason = Column(String(500), nullable=True, comment='跳过原因')
+    trade_time = Column(String(8), nullable=True, comment='成交时间(HH:MM:SS)')
 
 
 class StockPaperDailySnapshot(AuditTimeMixin, Base):
@@ -174,3 +177,25 @@ class StockPaperDailySnapshot(AuditTimeMixin, Base):
     position_value = Column(Float, nullable=False, default=0, comment='持仓市值')
     pnl = Column(Float, nullable=True, comment='累计盈亏')
     return_rate = Column(Float, nullable=True, comment='累计收益率')
+
+
+class StockFeishuMessage(AuditTimeMixin, Base):
+    """模拟盘交易信号发送到飞书后的消息凭据。"""
+
+    __tablename__ = 'stock_feishu_message'
+    __table_args__ = (
+        Index('ix_stock_feishu_message_signal_id', 'signal_id'),
+        Index('ix_stock_feishu_message_message_id', 'message_id'),
+        {'comment': '模拟盘飞书消息凭据表'},
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True, comment='记录ID')
+    message_type = Column(String(20), nullable=False, default='signal', comment='signal/signal_summary')
+    signal_id = Column(BigInteger, nullable=True, comment='关联信号ID，汇总消息为空')
+    account_id = Column(BigInteger, nullable=True, comment='账户ID，汇总消息为空')
+    code = Column(String(6), nullable=True, comment='股票代码，汇总消息为空')
+    message_id = Column(String(128), nullable=False, comment='飞书消息ID')
+    chat_id = Column(String(64), nullable=True, comment='飞书群ID')
+    recall_status = Column(String(16), nullable=False, default='sent', comment='sent/recalled/failed')
+    recall_reason = Column(String(500), nullable=True, comment='撤回原因或失败原因')
+    recalled_at = Column(DbUtcDateTime(), nullable=True, comment='撤回时间')

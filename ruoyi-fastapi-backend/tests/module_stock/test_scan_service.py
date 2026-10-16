@@ -92,6 +92,10 @@ async def test_run_scan_creates_batch_and_items(monkeypatch: pytest.MonkeyPatch)
         'module_stock.service.stock_scan_service.StockStrategyService._file',
         staticmethod(lambda name: SimpleNamespace()),
     )
+    monkeypatch.setattr(
+        'module_stock.service.stock_scan_service.StockStrategyService._metadata',
+        staticmethod(lambda path: {'is_portfolio': False}),
+    )
     monkeypatch.setattr(StockPoolDao, 'codes_by_pool', fake_codes)
     monkeypatch.setattr(
         'module_stock.service.stock_scan_service.StockStrategyService._coerce_strategy_params',
@@ -124,6 +128,10 @@ async def test_run_scan_rejects_empty_pool(monkeypatch: pytest.MonkeyPatch) -> N
         'module_stock.service.stock_scan_service.StockStrategyService._file',
         staticmethod(lambda name: SimpleNamespace()),
     )
+    monkeypatch.setattr(
+        'module_stock.service.stock_scan_service.StockStrategyService._metadata',
+        staticmethod(lambda path: {'is_portfolio': False}),
+    )
     monkeypatch.setattr(StockPoolDao, 'codes_by_pool', fake_codes)
     request = ScanRunRequestModel(strategyName='ma', poolName='空池', start='2024-01-01', end='2024-02-01')
 
@@ -155,7 +163,7 @@ async def test_execute_scan_marks_success_and_failure(monkeypatch: pytest.Monkey
     batch = SimpleNamespace(
         batch_id='b1', strategy_name='ma', pool_name='池', start_date='2024-01-01', end_date='2024-02-01',
         initial_cash=1000000, commission_rate='0.0003', stamp_tax_rate='0.001',
-        benchmark_code=None, strategy_params={},
+        benchmark_code=None, strategy_params={}, pool_codes=None,
     )
     updated_items: dict[int, str] = {}
     session_calls = 0

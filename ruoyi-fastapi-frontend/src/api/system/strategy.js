@@ -6,3 +6,6 @@ export const runStrategy = (data) => request({ url: '/stock/strategy/run', metho
 export const getRunStatus = (runId) => request({ url: `/stock/strategy/run/${runId}`, method: 'get' })
 export const getRunDetail = (runId) => request({ url: `/stock/strategy/run/${runId}/detail`, method: 'get' })
 export const getStrategyHistory = (strategyName, params) => request({ url: `/stock/strategy/${strategyName}/history`, method: 'get', params })
+export const validateStrategy = (data) => request({ url: '/stock/strategy/validate', method: 'post', data })
+export const getValidationStatus = (validationId) => request({ url: `/stock/strategy/validation/${validationId}`, method: 'get' })
+export const listValidations = (params) => request({ url: '/stock/strategy/validation', method: 'get', params })

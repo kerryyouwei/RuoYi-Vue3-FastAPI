@@ -14,7 +14,9 @@ from module_stock.entity.vo.stock_paper_vo import (
     PaperOrderModel,
     PaperPageQueryModel,
     PaperPositionModel,
+    PaperRealtimeQuoteModel,
     PaperSignalModel,
+    PaperSignalRecallRequestModel,
     PaperSnapshotModel,
     PaperUniverseModel,
 )
@@ -106,6 +108,25 @@ async def get_paper_signals(
     )
 
 
+@stock_paper_controller.post(
+    '/signals/{signal_id}/recall',
+    summary='撤回交易信号飞书通知',
+    description='根据已保存的飞书message_id撤回企业自建应用机器人发送的实时交易信号',
+    response_model=DataResponseModel[dict],
+    dependencies=[UserInterfaceAuthDependency('stock:paper:signal')],
+)
+async def recall_paper_signal_notification(
+    request: Request,
+    signal_id: int,
+    body: PaperSignalRecallRequestModel,
+    db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await StockPaperService.recall_signal_notification(db, signal_id, body.reason)
+    if result.get('status') != 'recalled':
+        return ResponseUtil.failure(msg=result.get('error_message') or '飞书通知撤回失败', data=result)
+    return ResponseUtil.success(msg='飞书通知已撤回', data=result)
+
+
 @stock_paper_controller.get(
     '/orders',
     summary='分页查询成交/跳过记录',
@@ -162,3 +183,42 @@ async def run_paper_signal(request: Request) -> Response:
 async def run_paper_execute(request: Request) -> Response:
     await StockPaperService.run_morning_execute()
     return ResponseUtil.success(msg='开盘撮合完成')
+
+
+@stock_paper_controller.post(
+    '/realtime/run',
+    summary='手动触发实时轮循',
+    description='交易时段内按实时行情计算模拟盘信号，信号变化立即自动撮合并刷新净值快照',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('stock:paper:execute')],
+)
+async def run_paper_realtime(request: Request) -> Response:
+    result = await StockPaperService.run_realtime_signal_and_execute()
+    return ResponseUtil.success(msg=result.get('message', '实时轮循执行完成'))
+
+
+@stock_paper_controller.get(
+    '/realtime-quotes',
+    summary='查询标的池实时行情',
+    description='返回标的池每只股票的实时价格与持仓浮动盈亏',
+    response_model=DataResponseModel[list[PaperRealtimeQuoteModel]],
+    dependencies=[UserInterfaceAuthDependency('stock:paper:list')],
+)
+async def get_paper_realtime_quotes(
+    request: Request,
+    db: Annotated[AsyncSession, DBSessionDependency()],
+    account_name: Annotated[str, Query(max_length=64)] = DEFAULT_ACCOUNT_NAME,
+) -> Response:
+    return ResponseUtil.success(data=await StockPaperService.get_realtime_quotes(db, account_name))
+
+
+@stock_paper_controller.post(
+    '/daily-sync/run',
+    summary='手动触发标的池日线同步',
+    description='开盘前同步模拟盘标的池所有股票的日线数据到MongoDB，确保收盘信号使用最新K线',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('stock:paper:execute')],
+)
+async def run_paper_daily_sync(request: Request) -> Response:
+    result = await StockPaperService.run_daily_sync()
+    return ResponseUtil.success(msg=result.get('message', '日线同步完成'))

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.vo import PageModel
 from module_stock.entity.do.stock_paper_do import (
+    StockFeishuMessage,
     StockPaperAccount,
     StockPaperDailySnapshot,
     StockPaperOrder,
@@ -22,8 +23,10 @@ class StockPaperDao:
     @staticmethod
     async def get_account(db: AsyncSession, account_name: str) -> StockPaperAccount | None:
         return (
-            await db.execute(select(StockPaperAccount).where(StockPaperAccount.account_name == account_name))
-        ).scalars().first()
+            (await db.execute(select(StockPaperAccount).where(StockPaperAccount.account_name == account_name)))
+            .scalars()
+            .first()
+        )
 
     @staticmethod
     async def create_account(db: AsyncSession, account: StockPaperAccount) -> StockPaperAccount:
@@ -39,15 +42,25 @@ class StockPaperDao:
     @staticmethod
     async def get_universe(db: AsyncSession, account_id: int) -> list[StockPaperUniverse]:
         rows = await db.execute(
-            select(StockPaperUniverse).where(StockPaperUniverse.account_id == account_id, StockPaperUniverse.status == 'active').order_by(StockPaperUniverse.code)
+            select(StockPaperUniverse)
+            .where(StockPaperUniverse.account_id == account_id, StockPaperUniverse.status == 'active')
+            .order_by(StockPaperUniverse.code)
         )
         return list(rows.scalars().all())
 
     @staticmethod
     async def get_universe_by_code(db: AsyncSession, account_id: int, code: str) -> StockPaperUniverse | None:
         return (
-            await db.execute(select(StockPaperUniverse).where(StockPaperUniverse.account_id == account_id, StockPaperUniverse.code == code))
-        ).scalars().first()
+            (
+                await db.execute(
+                    select(StockPaperUniverse).where(
+                        StockPaperUniverse.account_id == account_id, StockPaperUniverse.code == code
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
 
     @staticmethod
     async def add_universe(db: AsyncSession, universe: StockPaperUniverse) -> StockPaperUniverse:
@@ -76,14 +89,18 @@ class StockPaperDao:
     @staticmethod
     async def get_signal(db: AsyncSession, account_id: int, code: str, signal_date: str) -> StockPaperSignal | None:
         return (
-            await db.execute(
-                select(StockPaperSignal).where(
-                    StockPaperSignal.account_id == account_id,
-                    StockPaperSignal.code == code,
-                    StockPaperSignal.signal_date == signal_date,
+            (
+                await db.execute(
+                    select(StockPaperSignal).where(
+                        StockPaperSignal.account_id == account_id,
+                        StockPaperSignal.code == code,
+                        StockPaperSignal.signal_date == signal_date,
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
     @staticmethod
     async def create_signal(db: AsyncSession, signal: StockPaperSignal) -> StockPaperSignal:
@@ -97,19 +114,25 @@ class StockPaperDao:
 
     @staticmethod
     async def list_signals(db: AsyncSession, account_id: int, page_num: int, page_size: int) -> PageModel:
-        stmt = select(StockPaperSignal).where(StockPaperSignal.account_id == account_id).order_by(
-            StockPaperSignal.signal_date.desc(), StockPaperSignal.code
+        stmt = (
+            select(StockPaperSignal)
+            .where(StockPaperSignal.account_id == account_id)
+            .order_by(StockPaperSignal.signal_date.desc(), StockPaperSignal.code)
         )
         return await PageUtil.paginate(db, stmt, page_num, page_size, True)
 
     @staticmethod
-    async def pending_signals_by_execute_date(db: AsyncSession, account_id: int, execute_date: str) -> list[StockPaperSignal]:
+    async def pending_signals_by_execute_date(
+        db: AsyncSession, account_id: int, execute_date: str
+    ) -> list[StockPaperSignal]:
         rows = await db.execute(
-            select(StockPaperSignal).where(
+            select(StockPaperSignal)
+            .where(
                 StockPaperSignal.account_id == account_id,
                 StockPaperSignal.execute_date == execute_date,
                 StockPaperSignal.status == 'pending',
-            ).order_by(StockPaperSignal.code)
+            )
+            .order_by(StockPaperSignal.code)
         )
         return list(rows.scalars().all())
 
@@ -117,12 +140,65 @@ class StockPaperDao:
     async def delete_signals_by_account(db: AsyncSession, account_id: int) -> None:
         await db.execute(delete(StockPaperSignal).where(StockPaperSignal.account_id == account_id))
 
+    # ------------------------------------------------------------------ feishu message
+    @staticmethod
+    async def create_feishu_message(db: AsyncSession, message: StockFeishuMessage) -> StockFeishuMessage:
+        db.add(message)
+        await db.flush()
+        return message
+
+    @staticmethod
+    async def get_feishu_message_by_signal(
+        db: AsyncSession, signal_id: int, message_type: str = 'signal'
+    ) -> StockFeishuMessage | None:
+        return (
+            (
+                await db.execute(
+                    select(StockFeishuMessage)
+                    .where(
+                        StockFeishuMessage.signal_id == signal_id,
+                        StockFeishuMessage.message_type == message_type,
+                    )
+                    .order_by(StockFeishuMessage.id.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @staticmethod
+    async def update_feishu_message(db: AsyncSession, message_id: int, **values: object) -> None:
+        await db.execute(update(StockFeishuMessage).where(StockFeishuMessage.id == message_id).values(**values))
+
     # ---------------------------------------------------------------- position
     @staticmethod
     async def get_position(db: AsyncSession, account_id: int, code: str) -> StockPaperPosition | None:
         return (
-            await db.execute(select(StockPaperPosition).where(StockPaperPosition.account_id == account_id, StockPaperPosition.code == code))
-        ).scalars().first()
+            (
+                await db.execute(
+                    select(StockPaperPosition).where(
+                        StockPaperPosition.account_id == account_id, StockPaperPosition.code == code
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @staticmethod
+    async def get_position_by_code(db: AsyncSession, account_id: int, code: str) -> StockPaperPosition | None:
+        return (
+            (
+                await db.execute(
+                    select(StockPaperPosition).where(
+                        StockPaperPosition.account_id == account_id,
+                        StockPaperPosition.code == code,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
 
     @staticmethod
     async def create_position(db: AsyncSession, position: StockPaperPosition) -> StockPaperPosition:
@@ -137,7 +213,9 @@ class StockPaperDao:
     @staticmethod
     async def list_positions(db: AsyncSession, account_id: int) -> list[StockPaperPosition]:
         rows = await db.execute(
-            select(StockPaperPosition).where(StockPaperPosition.account_id == account_id).order_by(StockPaperPosition.code)
+            select(StockPaperPosition)
+            .where(StockPaperPosition.account_id == account_id)
+            .order_by(StockPaperPosition.code)
         )
         return list(rows.scalars().all())
 
@@ -145,7 +223,9 @@ class StockPaperDao:
     async def settle_positions(db: AsyncSession, account_id: int) -> None:
         """T+1 结算：将可卖数量置为全部持仓。"""
         await db.execute(
-            update(StockPaperPosition).where(StockPaperPosition.account_id == account_id).values(available_quantity=StockPaperPosition.quantity)
+            update(StockPaperPosition)
+            .where(StockPaperPosition.account_id == account_id)
+            .values(available_quantity=StockPaperPosition.quantity)
         )
 
     @staticmethod
@@ -155,7 +235,11 @@ class StockPaperDao:
 
     @staticmethod
     async def delete_positions_by_code(db: AsyncSession, account_id: int, code: str) -> None:
-        await db.execute(delete(StockPaperPosition).where(StockPaperPosition.account_id == account_id, StockPaperPosition.code == code))
+        await db.execute(
+            delete(StockPaperPosition).where(
+                StockPaperPosition.account_id == account_id, StockPaperPosition.code == code
+            )
+        )
 
     async def delete_positions_by_account(self: AsyncSession, account_id: int) -> None:
         await self.execute(delete(StockPaperPosition).where(StockPaperPosition.account_id == account_id))
@@ -169,8 +253,10 @@ class StockPaperDao:
 
     @staticmethod
     async def list_orders(db: AsyncSession, account_id: int, page_num: int, page_size: int) -> PageModel:
-        stmt = select(StockPaperOrder).where(StockPaperOrder.account_id == account_id).order_by(
-            StockPaperOrder.execute_date.desc(), StockPaperOrder.id.desc()
+        stmt = (
+            select(StockPaperOrder)
+            .where(StockPaperOrder.account_id == account_id)
+            .order_by(StockPaperOrder.execute_date.desc(), StockPaperOrder.id.desc())
         )
         return await PageUtil.paginate(db, stmt, page_num, page_size, True)
 
@@ -182,8 +268,16 @@ class StockPaperDao:
     @staticmethod
     async def get_snapshot(db: AsyncSession, account_id: int, date: str) -> StockPaperDailySnapshot | None:
         return (
-            await db.execute(select(StockPaperDailySnapshot).where(StockPaperDailySnapshot.account_id == account_id, StockPaperDailySnapshot.date == date))
-        ).scalars().first()
+            (
+                await db.execute(
+                    select(StockPaperDailySnapshot).where(
+                        StockPaperDailySnapshot.account_id == account_id, StockPaperDailySnapshot.date == date
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
 
     @staticmethod
     async def create_snapshot(db: AsyncSession, snapshot: StockPaperDailySnapshot) -> StockPaperDailySnapshot:
@@ -193,10 +287,14 @@ class StockPaperDao:
 
     @staticmethod
     async def update_snapshot(db: AsyncSession, snapshot_id: int, **values: object) -> None:
-        await db.execute(update(StockPaperDailySnapshot).where(StockPaperDailySnapshot.id == snapshot_id).values(**values))
+        await db.execute(
+            update(StockPaperDailySnapshot).where(StockPaperDailySnapshot.id == snapshot_id).values(**values)
+        )
 
     @staticmethod
-    async def list_snapshots(db: AsyncSession, account_id: int, start_date: str | None = None, end_date: str | None = None) -> list[StockPaperDailySnapshot]:
+    async def list_snapshots(
+        db: AsyncSession, account_id: int, start_date: str | None = None, end_date: str | None = None
+    ) -> list[StockPaperDailySnapshot]:
         stmt = select(StockPaperDailySnapshot).where(StockPaperDailySnapshot.account_id == account_id)
         if start_date:
             stmt = stmt.where(StockPaperDailySnapshot.date >= start_date)

@@ -80,3 +80,38 @@ export function runExecute() {
     timeout: 120000
   })
 }
+
+/** 手动触发实时轮循（信号变化立即自动撮合） */
+export function runRealtime() {
+  return request({
+    url: '/stock/paper/realtime/run',
+    method: 'post',
+    timeout: 120000
+  })
+}
+
+/** 手动触发标的池日线同步 */
+export function runDailySync() {
+  return request({
+    url: '/stock/paper/daily-sync/run',
+    method: 'post',
+    timeout: 300000
+  })
+}
+
+/** 查询标的池实时行情 */
+export function getRealtimeQuotes(accountName = 'default') {
+  return request({
+    url: '/stock/paper/realtime-quotes',
+    method: 'get',
+    params: { accountName }
+  })
+}
+/** 撤回交易信号飞书通知 */
+export function recallSignalNotification(signalId, reason = '信号作废，通知已撤回') {
+  return request({
+    url: `/stock/paper/signals/${signalId}/recall`,
+    method: 'post',
+    data: { reason }
+  })
+}

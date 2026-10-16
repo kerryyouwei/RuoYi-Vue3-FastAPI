@@ -1,8 +1,9 @@
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from module_stock.entity.do.stock_strategy_do import StockStrategyRun
-from utils.page_util import PageUtil
+from module_stock.entity.do.stock_strategy_do import StockStrategyRun, StockStrategyValidation
+from module_stock.entity.vo.stock_strategy_vo import StrategyValidationQueryModel
+from utils.page_util import PageModel, PageUtil
 
 
 class StockStrategyDao:
@@ -21,7 +22,7 @@ class StockStrategyDao:
         await db.execute(update(StockStrategyRun).where(StockStrategyRun.run_id == run_id).values(**values))
 
     @staticmethod
-    async def list_for_strategy(db: AsyncSession, strategy_name: str, page_num: int, page_size: int):
+    async def list_for_strategy(db: AsyncSession, strategy_name: str, page_num: int, page_size: int) -> PageModel:
         query = select(StockStrategyRun).where(StockStrategyRun.strategy_name == strategy_name).order_by(StockStrategyRun.create_time.desc())
         return await PageUtil.paginate(db, query, page_num, page_size, True)
 
@@ -41,3 +42,38 @@ class StockStrategyDao:
                 status='failed', error_message='服务重启导致回测中断', progress=100
             )
         )
+
+    # ---------------------------------------------------------------- validation
+
+    @staticmethod
+    async def create_validation(db: AsyncSession, validation: StockStrategyValidation) -> StockStrategyValidation:
+        db.add(validation)
+        await db.flush()
+        return validation
+
+    @staticmethod
+    async def get_validation(db: AsyncSession, validation_id: str) -> StockStrategyValidation | None:
+        stmt = select(StockStrategyValidation).where(StockStrategyValidation.validation_id == validation_id)
+        return (await db.execute(stmt)).scalars().first()
+
+    @staticmethod
+    async def update_validation(db: AsyncSession, validation_id: str, **values: object) -> None:
+        stmt = update(StockStrategyValidation).where(StockStrategyValidation.validation_id == validation_id).values(**values)
+        await db.execute(stmt)
+
+    @staticmethod
+    async def list_validations(db: AsyncSession, query: StrategyValidationQueryModel) -> PageModel:
+        stmt = select(StockStrategyValidation)
+        if query.strategy_name:
+            stmt = stmt.where(StockStrategyValidation.strategy_name == query.strategy_name)
+        stmt = stmt.order_by(StockStrategyValidation.create_time.desc(), StockStrategyValidation.validation_id.desc())
+        return await PageUtil.paginate(db, stmt, query.page_num, query.page_size, True)
+
+    @staticmethod
+    async def fail_orphaned_validations(db: AsyncSession) -> None:
+        stmt = (
+            update(StockStrategyValidation)
+            .where(StockStrategyValidation.status.in_(('pending', 'running')))
+            .values(status='failed', error_message='服务重启导致滚动验证中断', progress=100)
+        )
+        await db.execute(stmt)

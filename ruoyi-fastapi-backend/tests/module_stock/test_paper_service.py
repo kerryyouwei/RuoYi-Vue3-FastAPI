@@ -11,6 +11,7 @@ from exceptions.exception import ServiceException
 from module_stock.dao.stock_paper_dao import StockPaperDao
 from module_stock.dao.stock_scan_dao import StockScanDao
 from module_stock.entity.vo.stock_paper_vo import PaperAccountInitRequestModel
+from module_stock.service import stock_paper_service as paper_service_module
 from module_stock.service.stock_paper_service import (
     COMMISSION_RATE,
     DEFAULT_ACCOUNT_NAME,
@@ -18,11 +19,15 @@ from module_stock.service.stock_paper_service import (
     STAMP_TAX_RATE,
     StockPaperService,
 )
+from module_stock.service.stock_realtime_service import StockRealtimeService
 
 
 class FakeDb:
     async def commit(self) -> None:
         pass
+
+    async def refresh(self, obj: Any) -> None:
+        return None
 
     def __aenter__(self) -> 'FakeDb':
         return self
@@ -157,8 +162,12 @@ async def test_get_account_computes_equity(monkeypatch: pytest.MonkeyPatch) -> N
     async def fake_list_positions(db: Any, account_id: int) -> list[Any]:
         return positions
 
+    async def fake_refresh_position_prices(db: Any, positions: list[Any]) -> None:
+        return None
+
     monkeypatch.setattr(StockPaperDao, 'get_account', fake_get_account)
     monkeypatch.setattr(StockPaperDao, 'list_positions', fake_list_positions)
+    monkeypatch.setattr(StockPaperService, '_refresh_position_prices', fake_refresh_position_prices)
 
     result = await StockPaperService.get_account(FakeDb())
     assert result.position_value == 1000 * 12 + 200 * 45
@@ -351,3 +360,56 @@ async def test_pick_to_universe(monkeypatch: pytest.MonkeyPatch) -> None:
     result2 = await StockPaperService.pick_to_universe(FakeDb(), 'b1', ['000001'])
     assert result2['addedCount'] == 0
     assert result2['skippedCount'] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_positions_refreshes_stale_last_price(monkeypatch: pytest.MonkeyPatch) -> None:
+    """持仓最新价应取自实时行情而非数据库缓存价。"""
+    account = _make_account()
+    position = _make_position(code='603127', quantity=6400, avg_cost=51.48, last_price=48.79)
+    positions = [position]
+
+    async def fake_get_account(db: Any, name: str) -> Any:
+        return account
+
+    async def fake_list_positions(db: Any, account_id: int) -> list[Any]:
+        return positions
+
+    async def fake_fetch_realtime(codes: list[str]) -> list[dict[str, Any]]:
+        return [{'code': '603127', 'price': 50.65, 'volume': 1000.0, 'snapshot_time': '2026-10-15T10:31:00'}]
+
+    async def fake_update_position(db: Any, position_id: int, **values: Any) -> None:
+        update_calls.append((position_id, values))
+
+    update_calls: list[tuple[int, dict[str, Any]]] = []
+    paper_service_module._realtime_quote_cache.clear()
+    monkeypatch.setattr(StockPaperDao, 'get_account', fake_get_account)
+    monkeypatch.setattr(StockPaperDao, 'list_positions', fake_list_positions)
+    monkeypatch.setattr(StockPaperDao, 'update_position', fake_update_position)
+    monkeypatch.setattr(StockRealtimeService, 'fetch_realtime', fake_fetch_realtime)
+
+    result = await StockPaperService.list_positions(FakeDb())
+    assert len(result) == 1
+    assert result[0].last_price == 50.65
+    assert result[0].market_value == 6400 * 50.65
+    assert result[0].pnl == pytest.approx(6400 * (50.65 - 51.48))
+    assert update_calls and any('last_price' in v for _, v in update_calls)
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_keeps_cache_on_empty_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """行情源无返回时保留数据库缓存价。"""
+    position = _make_position(code='603127', quantity=6400, avg_cost=51.48, last_price=48.79)
+    positions = [position]
+
+    async def fake_fetch_realtime_quotes(codes: list[str]) -> dict[str, dict[str, Any]]:
+        return {}
+
+    async def fake_update_position(db: Any, position_id: int, **values: Any) -> None:
+        raise AssertionError('无有效行情时不应更新持仓价')
+
+    monkeypatch.setattr(StockPaperService, '_fetch_realtime_quotes_cached', fake_fetch_realtime_quotes)
+    monkeypatch.setattr(StockPaperDao, 'update_position', fake_update_position)
+
+    await StockPaperService._refresh_position_prices(FakeDb(), positions)
+    assert position.last_price == 48.79

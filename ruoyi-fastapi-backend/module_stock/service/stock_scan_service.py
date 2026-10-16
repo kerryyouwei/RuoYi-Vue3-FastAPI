@@ -35,9 +35,11 @@ class StockScanService:
     @classmethod
     async def run_scan(cls, db: AsyncSession, request: ScanRunRequestModel) -> str:
         StockStrategyService._file(request.strategy_name)
+        metadata = StockStrategyService._metadata(StockStrategyService._file(request.strategy_name))
         codes = await StockPoolDao.codes_by_pool(db, request.pool_name)
         if not codes:
             raise ServiceException(message=f'股票池「{request.pool_name}」不存在或为空')
+        pool_codes = [code for code, _name in codes]
         strategy_params = await asyncio.to_thread(
             StockStrategyService._coerce_strategy_params, request.strategy_name, request.strategy_params
         )
@@ -55,19 +57,28 @@ class StockScanService:
                 commission_rate=str(request.commission_rate),
                 stamp_tax_rate=str(request.stamp_tax_rate),
                 benchmark_code=request.benchmark_code,
+                pool_codes=pool_codes if metadata.get('is_portfolio') else None,
                 strategy_params=strategy_params,
                 status='pending',
                 progress=0,
-                total_count=len(codes),
+                total_count=1 if metadata.get('is_portfolio') else len(codes),
             ),
         )
-        await StockScanDao.bulk_create_items(
-            db,
-            [
-                StockScanItem(batch_id=batch_id, code=code, name=name, status='pending')
-                for code, name in codes
-            ],
-        )
+        scan_items = [
+            StockScanItem(batch_id=batch_id, code=code, name=name, status='pending')
+            for code, name in codes
+        ]
+        if metadata.get('is_portfolio'):
+            # 组合策略按股票池整体运行一次，不再逐股回测。
+            scan_items = [
+                StockScanItem(
+                    batch_id=batch_id,
+                    code=request.benchmark_code or '000300',
+                    name='组合回测（股票池）',
+                    status='pending',
+                )
+            ]
+        await StockScanDao.bulk_create_items(db, scan_items)
         await db.commit()
 
         task = asyncio.create_task(cls._execute_scan(batch_id), name=f'stock-scan-{batch_id}')
@@ -113,6 +124,7 @@ class StockScanService:
             'stamp_tax_rate': float(batch.stamp_tax_rate),
             'benchmark_code': batch.benchmark_code,
             'strategy_params': batch.strategy_params or {},
+            'pool_codes': batch.pool_codes or None,
         }
         semaphore = asyncio.Semaphore(2)
         total = len(items)
