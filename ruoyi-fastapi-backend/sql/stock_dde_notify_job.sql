@@ -11,10 +11,10 @@ insert into sys_job (
 select
     '股票池DDE大单资金通知', 'default', 'default', 'default',
     'module_task.stock_dde_notify_task.send_stock_pool_dde_notify',
-    '[]', '{"pool_name": "default", "top_n": 30}', '0 35 9-11,13-14 ? * MON-FRI', 'Asia/Shanghai',
+    '[]', '{"pool_name": "default", "top_n": 30, "force": false}', '0 35 9-11,13-14 ? * MON-FRI', 'Asia/Shanghai',
     1, false, 1, '0',
     'admin', current_timestamp, '', null,
-    '交易时段每小时推送股票池DDE大单资金飞书卡片，正数红色、负数绿色，涨停股不纳入可交易列表'
+    '交易时段每小时推送股票池DDE大单资金飞书卡片，正数红色、负数绿色，涨停股不纳入可交易列表；force=true时可绕过非交易日限制'
 from (select 1) as dummy
 where not exists (
     select 1 from sys_job

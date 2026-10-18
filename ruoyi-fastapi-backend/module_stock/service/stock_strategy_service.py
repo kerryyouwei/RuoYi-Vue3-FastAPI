@@ -39,6 +39,7 @@ _WEEKDAY_LIMIT = 5  # weekday() < 5 means Mon-Fri
 _STRATEGY_NAME = re.compile(r'^[a-z][a-z0-9_]*$')
 _ROOT = Path(__file__).resolve().parents[2]
 _STRATEGY_DIR = _ROOT / 'youw_test' / 'strategies'
+_INDEX_CODES = {'000300', '000905', '000852', '399006', '399330'}
 _RUNNING_TASKS: set[asyncio.Task[None]] = set()
 
 
@@ -425,6 +426,17 @@ class StockStrategyService:
                     skipped_universe.append({'code': universe_code, 'reason': '无日线数据'})
                     logger.bind(universe_code=universe_code).warning('组合策略标的未加载到数据，已跳过')
                     continue
+                # Backtrader 会等所有数据源都出现第一根 bar 后才进入策略 next。
+                # 若股票池里有回测起始日后才上市/开始有行情的标的，会把整组回测拖到
+                # 其首个交易日；这里显式跳过，并在 universeInfo 中返回原因。
+                universe_first_date = universe_data.index[0].date()
+                if universe_first_date > requested_start_date:
+                    reason = f'回测起始日后才有行情（{universe_first_date.isoformat()}）'
+                    skipped_universe.append({'code': universe_code, 'reason': reason})
+                    logger.bind(universe_code=universe_code, first_date=universe_first_date).warning(
+                        '组合策略标的数据起始日晚于回测起始日，已跳过'
+                    )
+                    continue
                 cerebro.adddata(
                     bt.feeds.PandasData(dataname=universe_data),
                     name=universe_code,
@@ -528,6 +540,7 @@ class StockStrategyService:
             'initialCash': float(start_value),
             'endingValue': float(end_value),
             'universeInfo': universe_info if universe else None,
+            'limitBlockedOrders': getattr(strategy, 'limit_blocked_orders', None),
         }
         strategy_returns = [round(item / start_value - 1, 6) for item in equity]
         peak = -math.inf
@@ -551,7 +564,12 @@ class StockStrategyService:
             record for record in getattr(strategy, 'execution_records', [])
             if record.get('date', '') >= str(start_date)[:10]
         ]
-        return {'summary': summary, 'curves': curves, 'trades': trades, 'run_logs': logs.getvalue().splitlines()}
+        return {
+            'summary': summary,
+            'curves': curves,
+            'trades': trades,
+            'run_logs': logs.getvalue().splitlines(),
+        }
 
     # ---------------------------------------------------------------- rolling validation
 
@@ -748,18 +766,105 @@ class StockStrategyService:
     def _load_tencent_etf_data(code: str, start: str, end: str):
         from youw_test.strategies.etf_data import fetch_etf_daily
 
-        return fetch_etf_daily(code, start, end)
+        data = fetch_etf_daily(code, start, end)
+        if data is not None and not data.empty:
+            # 回测用的腾讯行情兜底数据同步回 MongoDB，数据获取页面可直接查询。
+            StockStrategyService._persist_stock_day_data(code, data)
+        return data
 
     @classmethod
     def _load_stock_data(cls, code: str, start: str, end: str):
         """兼容股票、指数和腾讯ETF前复权日线的统一入口。"""
         data = cls._load_qa_daily_data(code, start, end, index=False)
         if data is not None:
-            return data
+            # Mongo 中可能残留早前回测写入的旧区间；不能只要非空就直接返回，
+            # 否则请求区间尾部新增交易日不会被兜底数据补齐。
+            if cls._is_stock_day_data_complete(data, start, end):
+                return data
+            cls._ensure_stock_day_data(code, start, end)
+            refreshed = cls._load_qa_daily_data(code, start, end, index=False)
+            if refreshed is not None and cls._is_stock_day_data_complete(refreshed, start, end):
+                return refreshed
+            fallback = cls._load_tencent_etf_data(code, start, end)
+            if fallback is None:
+                return data
+            return cls._merge_stock_day_data(data, fallback)
+
         data = cls._load_qa_daily_data(code, start, end, index=True)
         if data is not None:
-            return data
+            if cls._is_stock_day_data_complete(data, start, end):
+                return data
+            fallback = cls._load_tencent_etf_data(code, start, end)
+            if fallback is None:
+                return data
+            return cls._merge_stock_day_data(data, fallback)
+
         return cls._load_tencent_etf_data(code, start, end)
+
+    @staticmethod
+    def _merge_stock_day_data(primary: Any, fallback: Any):
+        """优先保留 Mongo 已有数据，并用兜底数据补齐缺失日期。"""
+        combined = primary.combine_first(fallback)
+        combined = combined[["open", "high", "low", "close", "volume"]].sort_index()
+        return combined.dropna(subset=["open", "high", "low", "close", "volume"])
+
+    @classmethod
+    def _persist_stock_day_data(cls, code: str, data: Any) -> None:
+        """将腾讯兜底日线按 QUANTAXIS schema 写入 MongoDB（失败不阻断回测）。"""
+        try:
+            import pandas as pd
+            import QUANTAXIS as QA
+            from pymongo import UpdateOne
+        except ImportError as exc:
+            logger.bind(code=code).warning(f'缺少 QUANTAXIS/pymongo，跳过回测日线回写：{exc}')
+            return
+
+        try:
+            frame = pd.DataFrame(
+                {
+                    'code': code,
+                    'date': data.index.strftime('%Y-%m-%d'),
+                    'open': pd.to_numeric(data['open'], errors='coerce'),
+                    'high': pd.to_numeric(data['high'], errors='coerce'),
+                    'low': pd.to_numeric(data['low'], errors='coerce'),
+                    'close': pd.to_numeric(data['close'], errors='coerce'),
+                    'vol': pd.to_numeric(data['volume'], errors='coerce'),
+                }
+            )
+            frame = frame.dropna(subset=['open', 'high', 'low', 'close', 'vol'])
+            if frame.empty:
+                return
+            frame['open'] = frame['open'].astype(float)
+            frame['high'] = frame['high'].astype(float)
+            frame['low'] = frame['low'].astype(float)
+            frame['close'] = frame['close'].astype(float)
+            frame['vol'] = frame['vol'].astype(float)
+            # 腾讯兜底接口没有成交额；用成交均价近似，保证日线查询页字段完整。
+            frame['amount'] = ((frame['open'] + frame['high'] + frame['low'] + frame['close']) / 4 * frame['vol']).round(2)
+            frame['date_stamp'] = frame['date'].map(QA.QA_util_date_stamp).astype(float)
+            frame['time_stamp'] = frame['date'].map(QA.QA_util_time_stamp).astype(float)
+            records = frame.to_dict(orient='records')
+
+            collections = [QA.DATABASE.stock_day]
+            if code in _INDEX_CODES:
+                collections.append(QA.DATABASE.index_day)
+            for collection in collections:
+                collection.create_index([('code', 1), ('date_stamp', 1)])
+                operations = [
+                    UpdateOne(
+                        {'code': record['code'], 'date_stamp': record['date_stamp']},
+                        {'$set': record},
+                        upsert=True,
+                    )
+                    for record in records
+                ]
+                if operations:
+                    collection.bulk_write(operations, ordered=False)
+            logger.bind(code=code, fetched=len(records), start=frame['date'].min(), end=frame['date'].max()).info(
+                '回测兜底日线已回写 MongoDB'
+            )
+        except Exception as exc:
+            logger.bind(code=code).warning(f'回测兜底日线回写 MongoDB 失败（不阻断回测）：{exc}')
     @staticmethod
     def _finite(value: Any) -> float | None:
         if value is None:
@@ -768,7 +873,7 @@ class StockStrategyService:
         return number if math.isfinite(number) else None
 
     @classmethod
-    def _status_model(cls, run: StockStrategyRun, detail: bool = False):
+    def _status_model(cls, run: StockStrategyRun, detail: bool = False, trade_page_num: int = 1, trade_page_size: int = 50):
         payload = {
             'run_id': run.run_id,
             'strategy_name': run.strategy_name,
@@ -792,18 +897,35 @@ class StockStrategyService:
             strategy_params=run.strategy_params or {},
             create_time=run.create_time,
             curves=run.curves,
-            trades=run.trades,
+            trades=(run.trades or [])[(trade_page_num - 1) * trade_page_size : trade_page_num * trade_page_size],
+            trade_total=len(run.trades or []),
             logs=run.run_logs,
         )
 
     @classmethod
-    async def status(cls, db: AsyncSession, run_id: str, detail: bool = False):
+    async def status(cls, db: AsyncSession, run_id: str, detail: bool = False, trade_page_num: int = 1, trade_page_size: int = 50):
         run = await StockStrategyDao.get(db, run_id)
         if run is None:
             logger.bind(run_id=run_id).warning('查询的股票策略回测记录不存在')
             raise ServiceException(message='回测记录不存在')
         logger.bind(run_id=run_id, status=run.status, progress=run.progress, detail=detail).debug('查询股票策略回测状态')
-        return cls._status_model(run, detail)
+        return cls._status_model(run, detail, trade_page_num, trade_page_size)
+
+    @classmethod
+    async def run_trades(cls, db: AsyncSession, run_id: str, page_num: int = 1, page_size: int = 50) -> dict[str, Any]:
+        """成交明细分页加载：只取 trades JSON 的当前页，避免一次返回全部。"""
+        run = await StockStrategyDao.get(db, run_id)
+        if run is None:
+            logger.bind(run_id=run_id).warning('查询的股票策略回测记录不存在')
+            raise ServiceException(message='回测记录不存在')
+        trades = run.trades or []
+        start = (page_num - 1) * page_size
+        return {
+            'trades': trades[start : start + page_size],
+            'total': len(trades),
+            'pageNum': page_num,
+            'pageSize': page_size,
+        }
 
     @classmethod
     async def history(cls, db: AsyncSession, strategy_name: str, query: StrategyHistoryQueryModel):
@@ -817,3 +939,6 @@ class StockStrategyService:
             await StockStrategyDao.fail_orphaned_validations(db)
             await db.commit()
         logger.info('股票策略遗留回测任务恢复检查完成')
+
+
+

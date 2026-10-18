@@ -90,8 +90,17 @@ class StrategyRunDetailModel(StrategyRunStatusModel):
     create_time: datetime | None = None
     curves: dict[str, Any] | None = None
     trades: list[dict[str, Any]] | None = None
+    trade_total: int = 0
     logs: list[str] | None = None
 
+
+class StrategyTradesPageModel(StrategyBaseModel):
+    """成交明细分页（大 JSON 单独加载，避免详情接口一次返回过多数据）。"""
+
+    trades: list[dict[str, Any]] = Field(default_factory=list)
+    total: int = 0
+    page_num: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=200)
 
 class StrategyHistoryQueryModel(StrategyBaseModel):
     page_num: int = Field(default=1, ge=1)

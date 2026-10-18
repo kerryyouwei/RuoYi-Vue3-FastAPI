@@ -7,7 +7,7 @@ from typing import Any
 import anyio
 
 from config.database import DataSourceRegistry
-from module_stock.dao.stock_pool_dao import StockPoolDao
+from module_stock.dao.stock_paper_dao import StockPaperDao
 from module_stock.service.stock_feishu_notification_service import FeishuNotificationService
 from module_stock.service.stock_selector_service import StockSelectorService
 from utils.log_util import logger
@@ -40,40 +40,42 @@ class DDEStockRow:
 
 
 class StockDDENotifyService:
-    """读取股票池、拉取同花顺问财DDE指标并推送飞书卡片。"""
+    """读取全账户标的池、拉取同花顺问财DDE指标并推送飞书卡片。"""
 
     @classmethod
-    async def send_pool_dde_notification(cls, pool_name: str = 'default', top_n: int = _TOP_DEFAULT) -> dict[str, Any]:
-        """对指定股票池执行一次DDE大单资金通知。"""
+    async def send_pool_dde_notification(cls, pool_name: str = 'default', top_n: int = _TOP_DEFAULT, force: bool = False) -> dict[str, Any]:
+        """对指定股票池执行一次DDE大单资金通知；force=True时绕过非交易日限制。"""
         now = datetime.now(TimezoneUtil.get_app_timezone())
-        if not cls._is_trading_day(now):
+        if not force and not cls._is_trading_day(now):
             return {
                 'ok': True,
                 'skipped': True,
                 'message': '非交易日，跳过DDE通知',
-                'pool_name': pool_name,
+                'pool_name': 'all_accounts',
             }
 
         async with DataSourceRegistry.session() as db:
-            pool_codes = await StockPoolDao.codes_by_pool(db, pool_name)
+            pool_codes = await StockPaperDao.list_universe_codes_all_accounts(db)
         if not pool_codes:
             return {
                 'ok': False,
                 'skipped': False,
-                'message': f'股票池 {pool_name} 为空',
-                'pool_name': pool_name,
+                'message': '全账户标的池为空',
+                'pool_name': 'all_accounts',
             }
 
         codes = [code for code, _ in pool_codes]
         candidate_count = len(codes)
         raw_rows = await cls._fetch_market_rows(codes)
+        logger.info('DDE问财原始行数 candidate_count={} raw_row_count={}', candidate_count, len(raw_rows))
         rows = cls._normalize_rows(raw_rows, pool_codes)
+        logger.info('DDE清洗后行数 normalized_row_count={}', len(rows))
         if not rows:
             return {
                 'ok': False,
                 'skipped': False,
-                'message': f'股票池 {pool_name} 未获取到有效DDE数据',
-                'pool_name': pool_name,
+                'message': '全账户标的池未获取到有效DDE数据',
+                'pool_name': 'all_accounts',
                 'candidate_count': candidate_count,
             }
 
@@ -104,7 +106,7 @@ class StockDDENotifyService:
             'ok': receipt.ok,
             'skipped': False,
             'message': receipt.error_message or 'DDE通知发送成功',
-            'pool_name': pool_name,
+            'pool_name': 'all_accounts',
             'candidate_count': len(rows),
             'inflow_count': len([row for row in tradable if (row.large_net or 0) > 0]),
             'outflow_count': len([row for row in tradable if (row.large_net or 0) < 0]),
@@ -137,6 +139,7 @@ class StockDDENotifyService:
                 continue
             datas = raw_result.get('datas') or []
             if isinstance(datas, list):
+                logger.info('DDE问财返回行数 returned_row_count={} code_count={} row_count={} status_code={} raw_result_keys={} pool_codes={}', len(datas), raw_result.get('code_count'), raw_result.get('row_count'), raw_result.get('status_code'), list(raw_result.keys()), chunk)
                 results.extend(item for item in datas if isinstance(item, dict))
             else:
                 logger.bind(pool_codes=chunk).warning('问财DDE查询缺少有效datas字段')

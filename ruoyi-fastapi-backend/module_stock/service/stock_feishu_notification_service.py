@@ -30,6 +30,7 @@ class FeishuSignal:
     time: str | None = None
     signal_id: int | None = None
     account_id: int | None = None
+    account_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -335,8 +336,10 @@ class FeishuNotificationService:
         name = signal.name or ''
         price = f'{signal.price:.2f}' if signal.price is not None else '未知'
         time_suffix = f'\n时间：{signal.time}' if signal.time else ''
+        account_prefix = f'账户：{signal.account_name}\n' if signal.account_name else ''
         text = (
             '【模拟交易信号】\n'
+            f'{account_prefix}'
             f'股票：{signal.code} {name}\n'
             f'信号：{signal.signal}\n'
             f'现价：{price}\n'
@@ -350,11 +353,19 @@ class FeishuNotificationService:
         return (await cls.send_signal_with_receipt(signal)).ok
 
     @staticmethod
-    def _build_signal_summary_text(signals: list[FeishuSignal], signal_date: str) -> str:
-        """构建收盘信号汇总文本。"""
+    def _build_signal_summary_text(
+        signals: list[FeishuSignal], signal_date: str, account_name: str | None = None
+    ) -> str:
+        '''构建收盘信号汇总文本。'''
         if not signals:
             return ''
-        lines = [f'【模拟交易收盘信号】{signal_date}']
+        if account_name:
+            header = f'【模拟交易收盘信号·{account_name}】{signal_date}'
+        else:
+            account_names = {signal.account_name for signal in signals if signal.account_name}
+            suffix = '（账户：' + '、'.join(sorted(account_names)) + '）' if account_names else ''
+            header = f'【模拟交易收盘信号】{signal_date}{suffix}'
+        lines = [header]
         for signal in signals:
             name = signal.name or ''
             price = f'{signal.price:.2f}' if signal.price is not None else '未知'
@@ -362,11 +373,15 @@ class FeishuNotificationService:
         return '\n'.join(lines)
 
     @classmethod
-    async def send_signal_summary_with_receipt(cls, signals: list[FeishuSignal], signal_date: str) -> FeishuSendResult:
-        """推送收盘后的当日交易信号汇总并返回发送凭据。"""
+    async def send_signal_summary_with_receipt(
+        cls, signals: list[FeishuSignal], signal_date: str, *, account_name: str | None = None
+    ) -> FeishuSendResult:
+        '''推送收盘后的当日交易信号汇总并返回发送凭据。'''
         if not signals:
             return FeishuSendResult(False, error_message='没有可发送的信号')
-        return await cls.send_text_with_receipt(cls._build_signal_summary_text(signals, signal_date))
+        return await cls.send_text_with_receipt(
+            cls._build_signal_summary_text(signals, signal_date, account_name)
+        )
 
     @classmethod
     async def send_signal_summary(cls, signals: list[FeishuSignal], signal_date: str) -> bool:

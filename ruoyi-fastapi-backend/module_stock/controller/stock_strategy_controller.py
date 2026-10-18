@@ -16,6 +16,7 @@ from module_stock.entity.vo.stock_strategy_vo import (
     StrategyRunDetailModel,
     StrategyRunRequest,
     StrategyRunStatusModel,
+    StrategyTradesPageModel,
     StrategyValidateRequest,
     StrategyValidationModel,
     StrategyValidationQueryModel,
@@ -60,6 +61,22 @@ async def run_status(request: Request, run_id: Annotated[str, Path()], db: Annot
 @stock_strategy_controller.get('/run/{run_id}/detail', response_model=DataResponseModel[StrategyRunDetailModel], dependencies=[UserInterfaceAuthDependency('stock:strategy:detail')])
 async def run_detail(request: Request, run_id: Annotated[str, Path()], db: Annotated[AsyncSession, DBSessionDependency()]) -> Response:
     return ResponseUtil.success(data=await StockStrategyService.status(db, run_id, detail=True))
+
+@stock_strategy_controller.get(
+    '/run/{run_id}/trades',
+    response_model=DataResponseModel[StrategyTradesPageModel],
+    dependencies=[UserInterfaceAuthDependency('stock:strategy:detail')],
+)
+async def run_trades(
+    request: Request,
+    run_id: Annotated[str, Path()],
+    db: Annotated[AsyncSession, DBSessionDependency()],
+    trade_page_num: Annotated[int, Query(ge=1)] = 1,
+    trade_page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> Response:
+    return ResponseUtil.success(
+        data=await StockStrategyService.run_trades(db, run_id, trade_page_num, trade_page_size)
+    )
 
 
 @stock_strategy_controller.post(

@@ -116,6 +116,7 @@ class ScanItemQueryModel(PaperBaseModel):
 class ScanPickRequestModel(PaperBaseModel):
     batch_id: str = Field(min_length=1, max_length=36)
     codes: list[str] = Field(min_length=1, max_length=500)
+    account_name: str | None = Field(default=None, max_length=64)
 
     @field_validator('codes')
     @classmethod
@@ -139,7 +140,9 @@ class PaperAccountInitRequestModel(PaperBaseModel):
     strategy_name: str = Field(min_length=1, max_length=64)
     initial_cash: int = Field(default=1_000_000, ge=1000, le=10_000_000_000)
     codes: list[str] = Field(default_factory=list, max_length=500)
+    pool_name: str | None = Field(default=None, min_length=1, max_length=64, description='股票池名称，与 codes 至少给一个，同时给定时合并去重')
     source_batch_id: str | None = None
+    replace: bool = Field(default=False, description='显式 true 时停用不在本次 codes 中的标的（跳过持仓标的）；默认保留现有标的池')
 
     @field_validator('account_name', mode='before')
     @classmethod
@@ -157,6 +160,38 @@ class PaperAccountInitRequestModel(PaperBaseModel):
                 raise ValueError(f'股票代码无效：{code}')
             codes.append(text)
         return list(dict.fromkeys(codes))
+
+
+class PaperAccountCreateModel(PaperBaseModel):
+    account_name: str = Field(min_length=1, max_length=64)
+    strategy_name: str = Field(min_length=1, max_length=64)
+    initial_cash: int = Field(default=1_000_000, ge=1000, le=10_000_000_000)
+    codes: list[str] = Field(default_factory=list, max_length=500)
+    pool_name: str | None = Field(default=None, min_length=1, max_length=64, description='股票池名称，与 codes 至少给一个，同时给定时合并去重')
+
+    @field_validator('account_name', mode='before')
+    @classmethod
+    def normalize_account_name(cls, value: Any) -> Any:
+        normalized = str(value or '').strip()
+        if not normalized:
+            raise ValueError('账户名称不能为空')
+        return normalized
+
+    @field_validator('codes')
+    @classmethod
+    def validate_codes(cls, value: list[str]) -> list[str]:
+        codes: list[str] = []
+        for code in value:
+            text = str(code or '').strip()
+            if len(text) != _CODE_LENGTH or not text.isdigit():
+                raise ValueError(f'股票代码无效：{code}')
+            codes.append(text)
+        return list(dict.fromkeys(codes))
+
+
+class PaperAccountUpdateModel(PaperBaseModel):
+    strategy_name: str | None = Field(default=None, min_length=1, max_length=64)
+    status: Literal['active', 'inactive'] | None = None
 
 
 class PaperAccountModel(PaperBaseModel):
@@ -178,6 +213,7 @@ class PaperUniverseModel(PaperBaseModel):
     code: str
     name: str | None = None
     source_batch_id: str | None = None
+    source_type: str = 'manual'
     status: str
 
 
@@ -257,3 +293,81 @@ class PaperPageQueryModel(PaperBaseModel):
     account_name: str = Field(default='default', max_length=64)
     page_num: int = Field(default=1, ge=1)
     page_size: int = Field(default=10, ge=1, le=100)
+
+
+class PaperUniverseAddRequestModel(PaperBaseModel):
+    """模拟盘标的池加入请求：codes 直接加入；poolName 整池加入；poolCodes 从原始池挑选加入。"""
+
+    account_name: str = Field(default='default', min_length=1, max_length=64)
+    codes: list[str] = Field(default_factory=list, max_length=500)
+    pool_name: str | None = Field(default=None, min_length=1, max_length=64, description='股票池名称，整池加入或 poolCodes 的所属池')
+    pool_codes: list[str] = Field(default_factory=list, max_length=500, description='从 poolName 对应的原始池中挑选的代码')
+    source_type: Literal['manual', 'pool', 'scan_pick', 'api'] | None = Field(default=None, description='来源类型；提供池来源时固定为 pool')
+
+    @field_validator('account_name', mode='before')
+    @classmethod
+    def normalize_account_name(cls, value: Any) -> Any:
+        normalized = str(value or '').strip()
+        return normalized or 'default'
+
+    @field_validator('codes', 'pool_codes')
+    @classmethod
+    def validate_codes(cls, value: list[str]) -> list[str]:
+        codes: list[str] = []
+        for code in value:
+            text = str(code or '').strip()
+            if len(text) != _CODE_LENGTH or not text.isdigit():
+                raise ValueError(f'股票代码无效：{code}')
+            codes.append(text)
+        return list(dict.fromkeys(codes))
+
+
+class PaperUniverseRemoveRequestModel(PaperBaseModel):
+    """模拟盘标的池移出请求：持仓中的标的整体拒绝。"""
+
+    account_name: str = Field(default='default', min_length=1, max_length=64)
+    codes: list[str] = Field(min_length=1, max_length=500)
+
+    @field_validator('account_name', mode='before')
+    @classmethod
+    def normalize_account_name(cls, value: Any) -> Any:
+        normalized = str(value or '').strip()
+        return normalized or 'default'
+
+    @field_validator('codes')
+    @classmethod
+    def validate_codes(cls, value: list[str]) -> list[str]:
+        codes: list[str] = []
+        for code in value:
+            text = str(code or '').strip()
+            if len(text) != _CODE_LENGTH or not text.isdigit():
+                raise ValueError(f'股票代码无效：{code}')
+            codes.append(text)
+        return list(dict.fromkeys(codes))
+
+
+class PaperUniverseAddResultModel(PaperBaseModel):
+    account_id: int
+    account_name: str
+    added_count: int = Field(ge=0)
+    skipped_count: int = Field(ge=0)
+
+
+class PaperUniverseRemoveResultModel(PaperBaseModel):
+    account_id: int
+    account_name: str
+    removed_count: int = Field(ge=0)
+
+
+class PaperUniverseLogModel(PaperBaseModel):
+    id: int
+    account_id: int
+    code: str
+    action: str
+    source_type: str
+    source_ref: str | None = None
+    create_time: datetime | None = None
+
+
+class PaperUniverseLogQueryModel(PaperPageQueryModel):
+    code: str | None = Field(default=None, min_length=6, max_length=6, pattern=r'^\d{6}$', description='可选，按股票代码过滤')

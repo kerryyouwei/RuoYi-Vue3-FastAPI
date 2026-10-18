@@ -130,6 +130,14 @@
             :loading="pickLoading"
             @click="handlePick"
           >加入模拟盘</el-button>
+          <el-select v-model="pickAccountName" filterable placeholder="目标账户" class="status-select">
+            <el-option
+              v-for="item in paperAccounts"
+              :key="item.id"
+              :label="item.accountName + (item.status === 'active' ? '' : '（停用）')"
+              :value="item.accountName"
+            />
+          </el-select>
           <el-select v-model="query.status" clearable placeholder="状态筛选" class="status-select" @change="handleQuery">
             <el-option label="成功" value="success" />
             <el-option label="失败" value="failed" />
@@ -193,6 +201,7 @@
 
 <script setup name="StockScan">
 import { getScan, getScanItems, pickToPaper, runScan } from '@/api/system/stockScan'
+import { listAccounts } from '@/api/system/stockPaper'
 import { getStrategy, listStrategies } from '@/api/system/strategy'
 import { listStockPoolNames } from '@/api/system/stockSelector'
 
@@ -205,6 +214,8 @@ const poolNames = ref([])
 const submitting = ref(false)
 const loading = ref(false)
 const pickLoading = ref(false)
+const paperAccounts = ref([])
+const pickAccountName = ref('default')
 const batch = ref(null)
 const rows = ref([])
 const total = ref(0)
@@ -377,7 +388,8 @@ async function handlePick() {
   try {
     const response = await pickToPaper({
       batchId: batch.value.batchId,
-      codes: selectedRows.value.map(row => row.code)
+      codes: selectedRows.value.map(row => row.code),
+      accountName: pickAccountName.value
     })
     const result = response.data
     proxy.$modal.msgSuccess(`已加入模拟盘：新增 ${result.addedCount} 只，跳过 ${result.skippedCount} 只`)
@@ -397,6 +409,13 @@ function resetForm() {
 onBeforeUnmount(() => clearTimeout(timer))
 loadStrategies()
 loadPoolNames()
+listAccounts().then(response => {
+  paperAccounts.value = response.data || []
+  const firstActive = paperAccounts.value.find(item => item.status === 'active')
+  if (firstActive) pickAccountName.value = firstActive.accountName
+}).catch(() => {
+  paperAccounts.value = []
+})
 </script>
 
 <style scoped>

@@ -91,8 +91,27 @@ class StockPaperUniverse(AuditTimeMixin, Base):
     account_id = Column(BigInteger, nullable=False, index=True, comment='账户ID')
     code = Column(String(6), nullable=False, index=True, comment='6位股票代码')
     name = Column(String(100), nullable=True, comment='股票简称')
-    source_batch_id = Column(String(36), nullable=True, comment='来源回测批次ID')
+    source_batch_id = Column(String(36), nullable=True, comment='来源回测批次ID或pool:池名')
+    source_type = Column(String(16), nullable=False, default='manual', comment='来源类型 manual/pool/scan_pick/init')
     status = Column(String(16), nullable=False, default='active', comment='active/inactive')
+
+
+class StockPaperUniverseLog(AuditTimeMixin, Base):
+    """模拟盘标的池变更日志。"""
+
+    __tablename__ = 'stock_paper_universe_log'
+    __table_args__ = (
+        Index('ix_stock_paper_universe_log_account_code', 'account_id', 'code'),
+        Index('ix_stock_paper_universe_log_account_time', 'account_id', 'create_time'),
+        {'comment': '模拟盘标的池变更日志表'},
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True, comment='记录ID')
+    account_id = Column(BigInteger, nullable=False, comment='账户ID')
+    code = Column(String(6), nullable=False, comment='6位股票代码')
+    action = Column(String(8), nullable=False, comment='动作 add/remove')
+    source_type = Column(String(16), nullable=False, default='manual', comment='来源类型 manual/pool/scan_pick/api')
+    source_ref = Column(String(64), nullable=True, comment='来源引用（pool:池名 或 批次ID）')
 
 
 class StockPaperSignal(AuditTimeMixin, Base):

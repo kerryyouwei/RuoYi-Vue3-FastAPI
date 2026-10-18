@@ -15,7 +15,7 @@ from module_stock.entity.vo.stock_paper_vo import (
     ScanPickRequestModel,
     ScanRunRequestModel,
 )
-from module_stock.service.stock_paper_service import StockPaperService
+from module_stock.service.stock_paper_service import DEFAULT_ACCOUNT_NAME, StockPaperService
 from module_stock.service.stock_scan_service import StockScanService
 from utils.log_util import logger
 from utils.response_util import ResponseUtil
@@ -85,7 +85,7 @@ async def pick_to_paper(
     body: ScanPickRequestModel,
     db: Annotated[AsyncSession, DBSessionDependency()],
 ) -> Response:
-    result = await StockPaperService.pick_to_universe(db, body.batch_id, body.codes)
+    result = await StockPaperService.pick_to_universe(db, body.batch_id, body.codes, body.account_name or DEFAULT_ACCOUNT_NAME)
     logger.bind(
         batch_id=body.batch_id, added_count=result['addedCount'], skipped_count=result['skippedCount']
     ).info('回测结果已勾选写入模拟盘标的池')

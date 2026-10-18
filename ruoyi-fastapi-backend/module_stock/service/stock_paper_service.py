@@ -13,6 +13,7 @@ from config.database import DataSourceRegistry
 from config.env import FeishuNotifyConfig
 from exceptions.exception import ServiceException
 from module_stock.dao.stock_paper_dao import StockPaperDao
+from module_stock.dao.stock_pool_dao import StockPoolDao
 from module_stock.dao.stock_scan_dao import StockScanDao
 from module_stock.entity.do.stock_paper_do import (
     StockFeishuMessage,
@@ -22,15 +23,20 @@ from module_stock.entity.do.stock_paper_do import (
     StockPaperPosition,
     StockPaperSignal,
     StockPaperUniverse,
+    StockPaperUniverseLog,
 )
 from module_stock.entity.vo.stock_day_vo import StockDayImportModel
 from module_stock.entity.vo.stock_paper_vo import (
+    PaperAccountCreateModel,
     PaperAccountInitRequestModel,
     PaperAccountModel,
+    PaperAccountUpdateModel,
     PaperPositionModel,
     PaperRealtimeQuoteModel,
     PaperSnapshotModel,
+    PaperUniverseAddRequestModel,
     PaperUniverseModel,
+    PaperUniverseRemoveRequestModel,
 )
 from module_stock.service.stock_day_service import StockDayService
 from module_stock.service.stock_feishu_notification_service import (
@@ -320,6 +326,35 @@ class StockPaperService:
             raise ServiceException(message='模拟账户尚未初始化，请先初始化账户')
         return account
 
+    @staticmethod
+    async def _target_accounts(db: AsyncSession, account_name: str | None) -> list[StockPaperAccount]:
+        '''account_name 为空时返回全部 active 账户，否则返回指定的 active 账户。'''
+        if account_name:
+            account = await StockPaperDao.get_account(db, account_name)
+            return [account] if account is not None and account.status == 'active' else []
+        return await StockPaperDao.list_accounts(db, status='active')
+
+    @staticmethod
+    async def _resolve_pool_codes(
+        db: AsyncSession, pool_name: str | None, codes: list[str]
+    ) -> tuple[list[str], dict[str, str], str | None]:
+        """合并请求 codes 与股票池代码，返回 (去重代码, 池内简称映射, 来源标记)。"""
+        name_map: dict[str, str] = {}
+        merged = list(dict.fromkeys(codes))
+        source: str | None = None
+        if pool_name:
+            pool_rows = await StockPoolDao.codes_by_pool(db, pool_name)
+            if not pool_rows:
+                raise ServiceException(message=f'股票池 {pool_name} 不存在或为空')
+            for code, name in pool_rows:
+                if name and code not in name_map:
+                    name_map[code] = name
+            merged = list(dict.fromkeys(merged + [code for code, _ in pool_rows]))
+            source = f'pool:{pool_name}'
+        if len(merged) > 500:
+            raise ServiceException(message=f'标的数量 {len(merged)} 超过上限 500，请精简股票池或代码列表')
+        return merged, name_map, source
+
     # ---------------------------------------------------------------- 初始化
     @classmethod
     async def init_account(cls, db: AsyncSession, request: PaperAccountInitRequestModel) -> dict[str, Any]:
@@ -342,43 +377,44 @@ class StockPaperService:
                 status=account.status,
             )
 
-        # 清空历史交易/信号/持仓/快照。
+        # 先记录当前持仓标的，replace 重置时跳过其停用；随后清空历史交易/信号/持仓/快照。
+        held_codes = await StockPaperDao.get_held_codes(db, account.id)
         await StockPaperDao.delete_positions_by_account(db, account.id)
         await StockPaperDao.delete_orders_by_account(db, account.id)
         await StockPaperDao.delete_signals_by_account(db, account.id)
         await StockPaperDao.delete_snapshots_by_account(db, account.id)
 
+        codes, pool_name_map, pool_source = await cls._resolve_pool_codes(db, request.pool_name, list(request.codes))
+        source_batch_id = request.source_batch_id or pool_source
+        name_map = dict(pool_name_map)
+        missing_codes = [code for code in codes if code not in name_map]
+        name_map.update(cls._stock_names_from_mongo(missing_codes))
+
         added_count = 0
         skipped_count = 0
         seen: set[str] = set()
-        if request.codes:
-            name_map = cls._stock_names_from_mongo(list(request.codes))
-            for code in request.codes:
+        if codes:
+            if source_batch_id and source_batch_id.startswith('pool:'):
+                init_source_type = 'pool'
+            elif request.source_batch_id:
+                init_source_type = 'scan_pick'
+            else:
+                init_source_type = 'init'
+            for code in codes:
                 if code in seen:
                     skipped_count += 1
                     continue
                 seen.add(code)
-                universe = await StockPaperDao.get_universe_by_code(db, account.id, code)
-                if universe is not None:
-                    await StockPaperDao.update_universe_by_code(
-                        db, account.id, code, source_batch_id=request.source_batch_id, status='active'
-                    )
+                if await cls._upsert_universe_one(
+                    db, account.id, code, name_map.get(code), init_source_type, source_batch_id
+                ) == 'added':
+                    added_count += 1
+                else:
                     skipped_count += 1
-                    continue
-                await StockPaperDao.add_universe(
-                    db,
-                    StockPaperUniverse(
-                        account_id=account.id,
-                        code=code,
-                        name=name_map.get(code),
-                        source_batch_id=request.source_batch_id,
-                        status='active',
-                    ),
-                )
-                added_count += 1
-            # 非本次 codes 中但仍在标的池的记录，一律停用。
-            await StockPaperDao.deactivate_universe_except(db, account.id, seen)
-        # codes 为空时保留现有标的池不变，仅重置资金与交易记录。
+            # 仅显式 replace 时停用非本次标的（并跳过持仓标的），避免误停用动态加入的标的。
+            if request.replace:
+                await StockPaperDao.deactivate_universe_except(db, account.id, seen, skip_held=held_codes)
+        # 未显式 replace 时保留现有标的池不变，仅重置资金与交易记录。
         await db.commit()
         logger.bind(account_name=request.account_name, added_count=added_count, skipped_count=skipped_count).info(
             '模拟账户初始化完成'
@@ -390,6 +426,132 @@ class StockPaperService:
             'skippedCount': skipped_count,
         }
 
+    # ---------------------------------------------------------------- 账户管理
+    @classmethod
+    async def list_accounts(cls, db: AsyncSession) -> list[PaperAccountModel]:
+        """返回全部模拟盘账户及概览指标（不刷新行情，仅用于列表展示）。"""
+        accounts = await StockPaperDao.list_accounts(db)
+        result: list[PaperAccountModel] = []
+        for account in accounts:
+            positions = await StockPaperDao.list_positions(db, account.id)
+            equity = cls._account_equity(account, positions)
+            result.append(
+                PaperAccountModel(
+                    id=account.id,
+                    account_name=account.account_name,
+                    strategy_name=account.strategy_name,
+                    initial_cash=account.initial_cash,
+                    cash=equity['cash'],
+                    total_equity=equity['total_equity'],
+                    position_value=equity['position_value'],
+                    return_rate=equity['return_rate'],
+                    pnl=equity['pnl'],
+                    status=account.status,
+                )
+            )
+        return result
+
+    @classmethod
+    async def create_account(
+        cls, db: AsyncSession, request: PaperAccountCreateModel
+    ) -> PaperAccountModel:
+        """新建模拟盘账户（不重置既有账户），可同时写入初始标的池。"""
+        StockStrategyService._file(request.strategy_name)
+        existing = await StockPaperDao.get_account(db, request.account_name)
+        if existing is not None:
+            raise ServiceException(message=f'模拟账户 {request.account_name} 已存在')
+        account = StockPaperAccount(
+            account_name=request.account_name,
+            strategy_name=request.strategy_name,
+            initial_cash=request.initial_cash,
+            cash=float(request.initial_cash),
+            status='active',
+        )
+        await StockPaperDao.create_account(db, account)
+        codes, pool_name_map, _pool_source = await cls._resolve_pool_codes(db, request.pool_name, list(request.codes))
+        name_map = dict(pool_name_map)
+        missing_codes = [code for code in codes if code not in name_map]
+        name_map.update(cls._stock_names_from_mongo(missing_codes))
+        for code in codes:
+            await StockPaperDao.add_universe(
+                db,
+                StockPaperUniverse(
+                    account_id=account.id, code=code, name=name_map.get(code), status='active'
+                ),
+            )
+        await db.commit()
+        return PaperAccountModel(
+            id=account.id,
+            account_name=account.account_name,
+            strategy_name=account.strategy_name,
+            initial_cash=account.initial_cash,
+            cash=account.cash,
+            status=account.status,
+        )
+
+    @classmethod
+    async def update_account_fields(
+        cls, db: AsyncSession, account_id: int, request: PaperAccountUpdateModel
+    ) -> PaperAccountModel:
+        """更新账户策略/启停状态。"""
+        account = (
+            await StockPaperDao.get_account_by_id(db, account_id)
+        )
+        if account is None:
+            raise ServiceException(message='模拟账户不存在')
+        values: dict[str, object] = {}
+        if request.strategy_name:
+            StockStrategyService._file(request.strategy_name)
+            values['strategy_name'] = request.strategy_name
+        if request.status:
+            values['status'] = request.status
+        if values:
+            await StockPaperDao.update_account(db, account_id, **values)
+            await db.commit()
+            for key, value in values.items():
+                setattr(account, key, value)
+        positions = await StockPaperDao.list_positions(db, account.id)
+        equity = cls._account_equity(account, positions)
+        return PaperAccountModel(
+            id=account.id,
+            account_name=account.account_name,
+            strategy_name=account.strategy_name,
+            initial_cash=account.initial_cash,
+            cash=equity['cash'],
+            total_equity=equity['total_equity'],
+            position_value=equity['position_value'],
+            return_rate=equity['return_rate'],
+            pnl=equity['pnl'],
+            status=account.status,
+        )
+
+    @classmethod
+    async def delete_account(cls, db: AsyncSession, account_id: int, force: bool = False) -> dict[str, Any]:
+        """删除模拟盘账户及其标的池/信号/持仓/成交/净值历史。
+
+        账户仍有持仓时默认拒绝，需显式 force=True 连同持仓一并删除；系统至少保留一个账户。
+        """
+        account = await StockPaperDao.get_account_by_id(db, account_id)
+        if account is None:
+            raise ServiceException(message='模拟账户不存在')
+        all_accounts = await StockPaperDao.list_accounts(db)
+        if len(all_accounts) <= 1:
+            raise ServiceException(message='系统至少保留一个模拟账户，无法删除')
+
+        positions = await StockPaperDao.list_positions(db, account.id)
+        if positions and not force:
+            raise ServiceException(message=f'账户 {account.account_name} 仍有 {len(positions)} 只持仓，请先清仓或确认强制删除')
+
+        await StockPaperDao.delete_universe_by_account(db, account.id)
+        await StockPaperDao.delete_signals_by_account(db, account.id)
+        await StockPaperDao.delete_positions_by_account(db, account.id)
+        await StockPaperDao.delete_orders_by_account(db, account.id)
+        await StockPaperDao.delete_snapshots_by_account(db, account.id)
+        await StockPaperDao.delete_feishu_messages_by_account(db, account.id)
+        await StockPaperDao.delete_account(db, account.id)
+        await db.commit()
+        logger.bind(account_name=account.account_name, account_id=account.id).info('模拟盘账户已删除')
+        return {'accountId': account.id, 'accountName': account.account_name, 'deletedPositions': len(positions)}
     # ---------------------------------------------------------------- 查询
     @classmethod
     async def get_account(cls, db: AsyncSession, account_name: str = DEFAULT_ACCOUNT_NAME) -> PaperAccountModel:
@@ -450,11 +612,13 @@ class StockPaperService:
 
     @classmethod
     async def list_universe(
-        cls, db: AsyncSession, account_name: str = DEFAULT_ACCOUNT_NAME
+        cls, db: AsyncSession, account_name: str = DEFAULT_ACCOUNT_NAME, status: str = 'active'
     ) -> list[PaperUniverseModel]:
-        """返回模拟盘当前标的池（含来源批次与状态）。"""
+        """返回模拟盘标的池明细（默认仅 active，可按 active/inactive/all 过滤）。"""
+        if status not in {'active', 'inactive', 'all'}:
+            raise ServiceException(message='status 仅支持 active/inactive/all')
         account = await cls._require_account(db, account_name)
-        items = await StockPaperDao.get_universe(db, account.id)
+        items = await StockPaperDao.list_universe(db, account.id, status=status)
         missing_uni = [i for i in items if not i.name]
         if missing_uni:
             name_map = cls._stock_names_from_mongo([i.code for i in missing_uni])
@@ -555,77 +719,102 @@ class StockPaperService:
 
     # ---------------------------------------------------------------- 收盘信号
     @classmethod
-    async def run_eod_signal(cls) -> None:
+    async def run_eod_signal(cls, account_name: str | None = None) -> None:
+        """计算收盘信号。account_name 为空时处理全部 active 账户。"""
         today = cls._today()
         if not cls._is_trading_day(today):
             logger.bind(today=today).info('非交易日，跳过模拟盘收盘信号计算')
             return
         async with DataSourceRegistry.session(log_sql=False) as db:
-            account = await StockPaperDao.get_account(db, DEFAULT_ACCOUNT_NAME)
-            if account is None or account.status != 'active':
+            accounts = await cls._target_accounts(db, account_name)
+            if not accounts:
                 logger.bind(today=today).info('模拟账户未初始化或非激活，跳过收盘信号')
                 return
-            universe = await StockPaperDao.get_universe(db, account.id)
-            if not universe:
-                logger.bind(today=today).info('模拟盘标的池为空，跳过收盘信号')
-                return
-            if not account.strategy_name:
-                logger.bind(today=today).warning('模拟账户未配置策略，跳过收盘信号')
-                return
-
-            execute_date = cls._next_trading_day(today)
-            universe_names = {item.code: item.name for item in universe}
-            signal_notifications: list[FeishuSignal] = []
-            position_by_code = {p.code: p for p in await StockPaperDao.list_positions(db, account.id)}
-            for item in universe:
-                close = await asyncio.to_thread(cls._fetch_close, item.code, today)
-                position = position_by_code.get(item.code)
-                if close is None or close <= 0:
-                    logger.bind(code=item.code, today=today).warning('未获取到收盘价，跳过该标的信号计算')
+            for account in accounts:
+                try:
+                    notifications = await cls._run_eod_signal_for_account(db, account, today)
+                except Exception as exc:
+                    await db.rollback()
+                    logger.bind(
+                        today=today, account_name=account.account_name
+                    ).error(f'模拟盘收盘信号计算失败（账户 {account.account_name}）：{exc}')
                     continue
-                if position is not None:
-                    await StockPaperDao.update_position(db, position.id, last_price=close)
-                signal = await asyncio.to_thread(
-                    StockSignalService.compute_signal,
-                    account.strategy_name,
-                    item.code,
-                    {},
-                    today,
-                    close,
-                )
-                paper_signal = await cls._upsert_signal(
-                    db,
-                    account.id,
-                    item.code,
-                    today,
-                    execute_date,
-                    signal['signal'],
-                    signal['reason'],
-                    close,
-                    reset_status=False,
-                )
-                signal_notifications.append(
-                    FeishuSignal(
-                        code=item.code,
-                        name=universe_names.get(item.code),
-                        signal=signal['signal'],
-                        price=close,
-                        reason=signal['reason'],
-                        signal_id=paper_signal.id,
-                        account_id=account.id,
+                if notifications:
+                    _notify_task = asyncio.create_task(
+                        cls._notify_eod_summary(notifications, today, account.account_name)
                     )
+                    del _notify_task
+
+    @classmethod
+    async def _run_eod_signal_for_account(
+        cls, db: AsyncSession, account: StockPaperAccount, today: str
+    ) -> list[FeishuSignal]:
+        """单个账户的收盘信号计算，返回待通知信号列表。"""
+        universe = await StockPaperDao.get_universe(db, account.id)
+        if not universe:
+            logger.bind(today=today, account_name=account.account_name).info('模拟盘标的池为空，跳过收盘信号')
+            return []
+        if not account.strategy_name:
+            logger.bind(today=today, account_name=account.account_name).warning('模拟账户未配置策略，跳过收盘信号')
+            return []
+
+        execute_date = cls._next_trading_day(today)
+        universe_names = {item.code: item.name for item in universe}
+        signal_notifications: list[FeishuSignal] = []
+        position_by_code = {p.code: p for p in await StockPaperDao.list_positions(db, account.id)}
+        for item in universe:
+            close = await asyncio.to_thread(cls._fetch_close, item.code, today)
+            position = position_by_code.get(item.code)
+            if close is None or close <= 0:
+                logger.bind(code=item.code, today=today).warning('未获取到收盘价，跳过该标的信号计算')
+                continue
+            if position is not None:
+                await StockPaperDao.update_position(db, position.id, last_price=close)
+            signal = await asyncio.to_thread(
+                StockSignalService.compute_signal,
+                account.strategy_name,
+                item.code,
+                {},
+                today,
+                close,
+            )
+            paper_signal = await cls._upsert_signal(
+                db,
+                account.id,
+                item.code,
+                today,
+                execute_date,
+                signal['signal'],
+                signal['reason'],
+                close,
+                reset_status=False,
+            )
+            signal_notifications.append(
+                FeishuSignal(
+                    code=item.code,
+                    name=universe_names.get(item.code),
+                    signal=signal['signal'],
+                    price=close,
+                    reason=signal['reason'],
+                    signal_id=paper_signal.id,
+                    account_id=account.id,
+                    account_name=account.account_name,
                 )
+            )
 
-            await cls._upsert_snapshot(db, account)
-            await db.commit()
-        logger.bind(today=today, execute_date=execute_date, count=len(universe)).info('模拟盘收盘信号计算完成')
-        _notify_task = asyncio.create_task(cls._notify_eod_summary(signal_notifications, today))
-        del _notify_task
-
+        await cls._upsert_snapshot(db, account)
+        await db.commit()
+        logger.bind(
+            today=today, execute_date=execute_date, count=len(universe), account_name=account.account_name
+        ).info('模拟盘收盘信号计算完成')
+        return signal_notifications
     # ---------------------------------------------------------------- 实时轮循
     @classmethod
-    async def run_realtime_signal_and_execute(cls) -> dict[str, Any]:
-        """每分钟轮循标的池实时行情，信号变化时立即撮合并刷新当日净值快照。"""
+    async def run_realtime_signal_and_execute(cls, account_name: str | None = None) -> dict[str, Any]:
+        """每分钟轮循标的池实时行情，信号变化时立即撮合并刷新当日净值快照。
+
+        account_name 为空时处理全部 active 账户。
+        """
         now = datetime.now(TimezoneUtil.get_app_timezone())
         today = now.date().isoformat()
         if not cls._is_trading_day(today):
@@ -635,50 +824,26 @@ class StockPaperService:
             logger.bind(today=today, time=now.strftime('%H:%M:%S')).info('非交易时段，跳过模拟盘实时轮循')
             return {'executed': 0, 'skipped': 0, 'message': '非交易时段，跳过实时轮循'}
 
+        executed_count = 0
+        skipped_count = 0
+        signal_notifications: list[FeishuSignal] = []
         async with DataSourceRegistry.session(log_sql=False) as db:
-            account = await StockPaperDao.get_account(db, DEFAULT_ACCOUNT_NAME)
-            if account is None or account.status != 'active':
+            accounts = await cls._target_accounts(db, account_name)
+            if not accounts:
                 logger.bind(today=today).info('模拟账户未初始化或非激活，跳过实时轮循')
                 return {'executed': 0, 'skipped': 0, 'message': '模拟账户未初始化或非激活'}
-            if not account.strategy_name:
-                logger.bind(today=today).warning('模拟账户未配置策略，跳过实时轮循')
-                return {'executed': 0, 'skipped': 0, 'message': '模拟账户未配置策略'}
-
-            universe = await StockPaperDao.get_universe(db, account.id)
-            if not universe:
-                logger.bind(today=today).info('模拟盘标的池为空，跳过实时轮循')
-                return {'executed': 0, 'skipped': 0, 'message': '模拟盘标的池为空'}
-
-            codes = [item.code for item in universe]
-            universe_names = {item.code: item.name for item in universe}
-            positions = {p.code: p for p in await StockPaperDao.list_positions(db, account.id)}
-            active_count = max(len(codes), 1)
-            quotes = await StockRealtimeService.fetch_realtime(codes)
-            quotes_by_code = {q['code']: q for q in quotes}
-
-            executed_count = 0
-            skipped_count = 0
-            signal_notifications: list[FeishuSignal] = []
-            for code in codes:
-                notification, status = await cls._process_realtime_symbol(
-                    db,
-                    account,
-                    code,
-                    universe_names.get(code),
-                    quotes_by_code.get(code),
-                    positions,
-                    today,
-                    active_count,
-                )
-                if status == 'executed':
-                    executed_count += 1
-                elif status == 'skipped':
-                    skipped_count += 1
-                if notification is not None:
-                    signal_notifications.append(notification)
-
-            await cls._upsert_snapshot(db, account)
-            await db.commit()
+            for account in accounts:
+                try:
+                    executed, skipped, notifications = await cls._realtime_signal_for_account(db, account, today)
+                except Exception as exc:
+                    await db.rollback()
+                    logger.bind(
+                        today=today, account_name=account.account_name
+                    ).error(f'模拟盘实时轮循失败（账户 {account.account_name}）：{exc}')
+                    continue
+                executed_count += executed
+                skipped_count += skipped
+                signal_notifications.extend(notifications)
 
         message = f'模拟盘实时轮循完成：撮合{executed_count}笔，跳过{skipped_count}只'
         logger.bind(today=today, executed_count=executed_count, skipped_count=skipped_count).info(message)
@@ -688,10 +853,60 @@ class StockPaperService:
         return {'executed': executed_count, 'skipped': skipped_count, 'message': message}
 
     @classmethod
-    async def _notify_eod_summary(cls, signal_notifications: list[FeishuSignal], today: str) -> None:
-        """后台发送飞书收盘信号汇总并保存消息凭据，避免阻塞主 session。"""
+    async def _realtime_signal_for_account(
+        cls, db: AsyncSession, account: StockPaperAccount, today: str
+    ) -> tuple[int, int, list[FeishuSignal]]:
+        """单个账户的实时信号计算与撮合，返回（撮合数、跳过数、待通知信号）。"""
+        if not account.strategy_name:
+            logger.bind(today=today, account_name=account.account_name).warning('模拟账户未配置策略，跳过实时轮循')
+            return 0, 0, []
+
+        universe = await StockPaperDao.get_universe(db, account.id)
+        if not universe:
+            logger.bind(today=today, account_name=account.account_name).info('模拟盘标的池为空，跳过实时轮循')
+            return 0, 0, []
+
+        codes = [item.code for item in universe]
+        universe_names = {item.code: item.name for item in universe}
+        positions = {p.code: p for p in await StockPaperDao.list_positions(db, account.id)}
+        active_count = max(len(codes), 1)
+        quotes = await StockRealtimeService.fetch_realtime(codes)
+        quotes_by_code = {q['code']: q for q in quotes}
+
+        executed_count = 0
+        skipped_count = 0
+        signal_notifications: list[FeishuSignal] = []
+        for code in codes:
+            notification, status = await cls._process_realtime_symbol(
+                db,
+                account,
+                code,
+                universe_names.get(code),
+                quotes_by_code.get(code),
+                positions,
+                today,
+                active_count,
+            )
+            if status == 'executed':
+                executed_count += 1
+            elif status == 'skipped':
+                skipped_count += 1
+            if notification is not None:
+                signal_notifications.append(notification)
+
+        await cls._upsert_snapshot(db, account)
+        await db.commit()
+        return executed_count, skipped_count, signal_notifications
+
+    @classmethod
+    async def _notify_eod_summary(
+        cls, signal_notifications: list[FeishuSignal], today: str, account_name: str | None = None
+    ) -> None:
+        '''后台发送飞书收盘信号汇总并保存消息凭据，避免阻塞主 session。'''
         try:
-            summary_result = await FeishuNotificationService.send_signal_summary_with_receipt(signal_notifications, today)
+            summary_result = await FeishuNotificationService.send_signal_summary_with_receipt(
+                signal_notifications, today, account_name=account_name
+            )
             await cls._save_feishu_receipt('signal_summary', None, None, summary_result)
         except Exception as exc:
             logger.bind(channel='feishu', today=today).warning(f'飞书收盘信号通知发送/凭据保存失败：{exc}')
@@ -798,6 +1013,10 @@ class StockPaperService:
         active_count: int,
     ) -> tuple[FeishuSignal | None, str]:
         """处理单只标的实时信号，返回待通知信号与处理状态。"""
+        universe_item = await StockPaperDao.get_universe_by_code(db, account.id, code)
+        if universe_item is None or universe_item.status != 'active':
+            logger.bind(code=code, today=today).warning('标的已移出标的池，跳过实时信号')
+            return None, 'skipped'
         price = _to_float(quote['price']) if quote is not None else None
         if price is None or price <= 0:
             logger.bind(code=code, today=today).warning('未获取到实时价，跳过该标的实时信号')
@@ -846,37 +1065,44 @@ class StockPaperService:
                 reason=reason,
                 signal_id=sig.id,
                 account_id=account.id,
+                account_name=account.account_name,
             )
         return notification, 'executed'
 
     # ---------------------------------------------------------------- 标的池日线同步
     @classmethod
-    async def run_daily_sync(cls) -> dict[str, Any]:
-        """开盘前同步标的池日线数据到MongoDB，确保收盘信号使用最新K线。"""
+    async def run_daily_sync(cls, account_name: str | None = None) -> dict[str, Any]:
+        """开盘前同步标的池日线数据到MongoDB，确保收盘信号使用最新K线。
+
+        account_name 为空时合并全部 active 账户的标的池（去重）后统一同步。
+        """
         today = cls._today()
         if not cls._is_trading_day(today):
             logger.bind(today=today).info('非交易日，跳过标的池日线同步')
             return {'synced': [], 'failed': {}, 'message': '非交易日，跳过日线同步'}
 
         async with DataSourceRegistry.session(log_sql=False) as db:
-            account = await StockPaperDao.get_account(db, DEFAULT_ACCOUNT_NAME)
-            if account is None or account.status != 'active':
+            accounts = await cls._target_accounts(db, account_name)
+            if not accounts:
                 logger.bind(today=today).info('模拟账户未初始化或非激活，跳过日线同步')
                 return {'synced': [], 'failed': {}, 'message': '模拟账户未初始化或非激活'}
 
-            universe = await StockPaperDao.get_universe(db, account.id)
-            if not universe:
-                logger.bind(today=today).info('模拟盘标的池为空，跳过日线同步')
-                return {'synced': [], 'failed': {}, 'message': '模拟盘标的池为空'}
+            codes: set[str] = set()
+            for account in accounts:
+                universe = await StockPaperDao.get_universe(db, account.id)
+                codes.update(item.code for item in universe)
 
-        codes = [item.code for item in universe]
+        if not codes:
+            logger.bind(today=today).info('模拟盘标的池为空，跳过日线同步')
+            return {'synced': [], 'failed': {}, 'message': '模拟盘标的池为空'}
+
         now = datetime.now(TimezoneUtil.get_app_timezone())
         start_date = (now - timedelta(days=30)).date()
         end_date = now.date()
 
         synced: list[str] = []
         failed: dict[str, str] = {}
-        for code in codes:
+        for code in sorted(codes):
             succeeded, error = await cls._sync_single_stock_day(code, start_date, end_date)
             if succeeded:
                 synced.append(code)
@@ -887,7 +1113,6 @@ class StockPaperService:
         message = f'标的池日线同步完成：成功{len(synced)}只，失败{len(failed)}只'
         logger.bind(today=today, synced_count=len(synced), failed_count=len(failed)).info(message)
         return {'synced': synced, 'failed': failed, 'message': message}
-
     @staticmethod
     async def _sync_single_stock_day(code: str, start_date: date, end_date: date) -> tuple[bool, str | None]:
         """同步单只标的日线，返回是否成功与失败原因。"""
@@ -967,42 +1192,65 @@ class StockPaperService:
 
     # ---------------------------------------------------------------- 开盘撮合
     @classmethod
-    async def run_morning_execute(cls) -> None:
+    async def run_morning_execute(cls, account_name: str | None = None) -> None:
+        """开盘撮合。account_name 为空时处理全部 active 账户。"""
         today = cls._today()
         if not cls._is_trading_day(today):
             logger.bind(today=today).info('非交易日，跳过模拟盘开盘撮合')
             return
         async with DataSourceRegistry.session(log_sql=False) as db:
-            account = await StockPaperDao.get_account(db, DEFAULT_ACCOUNT_NAME)
-            if account is None or account.status != 'active':
+            accounts = await cls._target_accounts(db, account_name)
+            if not accounts:
                 logger.bind(today=today).info('模拟账户未初始化或非激活，跳过开盘撮合')
                 return
-            await StockPaperDao.settle_positions(db, account.id)
+            for account in accounts:
+                try:
+                    await cls._morning_execute_for_account(db, account, today)
+                except Exception as exc:
+                    await db.rollback()
+                    logger.bind(
+                        today=today, account_name=account.account_name
+                    ).error(f'模拟盘开盘撮合失败（账户 {account.account_name}）：{exc}')
 
-            signals = await StockPaperDao.pending_signals_by_execute_date(db, account.id, today)
-            positions = {p.code: p for p in await StockPaperDao.list_positions(db, account.id)}
-            universe = await StockPaperDao.get_universe(db, account.id)
-            universe_names = {item.code: item.name for item in universe}
-            active_count = max(len(universe), 1)
-            equity = cls._account_equity(account, list(positions.values()))
-            total_equity = equity['total_equity']
+    @classmethod
+    async def _morning_execute_for_account(
+        cls, db: AsyncSession, account: StockPaperAccount, today: str
+    ) -> None:
+        """单个账户的开盘撮合：T+1 结算可卖数量后执行待执行信号。"""
+        await StockPaperDao.settle_positions(db, account.id)
 
-            for signal in signals:
-                price = await asyncio.to_thread(cls._fetch_open, signal.code)
-                name = universe_names.get(signal.code)
+        signals = await StockPaperDao.pending_signals_by_execute_date(db, account.id, today)
+        positions = {p.code: p for p in await StockPaperDao.list_positions(db, account.id)}
+        universe = await StockPaperDao.get_universe(db, account.id)
+        universe_names = {item.code: item.name for item in universe}
+        active_count = max(len(universe), 1)
+        equity = cls._account_equity(account, list(positions.values()))
+        total_equity = equity['total_equity']
+
+        for signal in signals:
+            if signal.code not in universe_names:
+                # 标的已移出标的池：买入/卖出信号标记跳过，持有信号直接结案。
                 if signal.signal == '持有':
                     await StockPaperDao.update_signal(db, signal.id, status='executed')
-                    continue
-                if signal.signal == '买入':
-                    await cls._execute_buy(db, account, signal, name, positions, total_equity, active_count, price)
-                elif signal.signal == '卖出':
-                    await cls._execute_sell(db, account, signal, name, positions, price)
                 else:
-                    await StockPaperDao.update_signal(db, signal.id, status='skipped')
-                await db.flush()
-            await db.commit()
-        logger.bind(today=today, execute_count=len(signals)).info('模拟盘开盘撮合完成')
-
+                    await cls._mark_skipped(db, account.id, signal, None, None, '标的池已移除')
+                continue
+            price = await asyncio.to_thread(cls._fetch_open, signal.code)
+            name = universe_names.get(signal.code)
+            if signal.signal == '持有':
+                await StockPaperDao.update_signal(db, signal.id, status='executed')
+                continue
+            if signal.signal == '买入':
+                await cls._execute_buy(db, account, signal, name, positions, total_equity, active_count, price)
+            elif signal.signal == '卖出':
+                await cls._execute_sell(db, account, signal, name, positions, price)
+            else:
+                await StockPaperDao.update_signal(db, signal.id, status='skipped')
+            await db.flush()
+        await db.commit()
+        logger.bind(
+            today=today, execute_count=len(signals), account_name=account.account_name
+        ).info('模拟盘开盘撮合完成')
     @classmethod
     async def _execute_buy(
         cls,
@@ -1097,6 +1345,7 @@ class StockPaperService:
                 stamp_tax=0.0,
                 signal_id=signal.id,
                 account_id=account.id,
+                account_name=account.account_name,
             )
         )
         del _notify_task
@@ -1176,6 +1425,7 @@ class StockPaperService:
                 stamp_tax=stamp_tax,
                 signal_id=signal.id,
                 account_id=account.id,
+                account_name=account.account_name,
             )
         )
         del _notify_task
@@ -1193,11 +1443,14 @@ class StockPaperService:
         stamp_tax: float,
         signal_id: int | None = None,
         account_id: int | None = None,
+        account_name: str | None = None,
     ) -> None:
-        """后台发送飞书成交提示消息并保存消息凭据，避免阻塞撮合主流程。"""
+        '''后台发送飞书成交提示消息并保存消息凭据，避免阻塞撮合主流程。'''
         try:
+            account_prefix = f'账户：{account_name}\n' if account_name else ''
             text = (
                 '【模拟交易成交】\n'
+                f'{account_prefix}'
                 f'股票：{code} {name or ""}\n'
                 f'方向：{side}\n'
                 f'成交价：{price:.2f}\n'
@@ -1251,17 +1504,158 @@ class StockPaperService:
         await StockPaperDao.update_signal(db, signal.id, status='skipped')
         signal.status = 'skipped'
 
+    # ---------------------------------------------------------------- 标的池动态增删
+    @classmethod
+    async def _upsert_universe_one(
+        cls,
+        db: AsyncSession,
+        account_id: int,
+        code: str,
+        name: str | None,
+        source_type: str,
+        source_batch_id: str | None,
+    ) -> str:
+        """幂等写入单只标的：active 跳过，inactive 重新激活并覆盖来源，缺失则新增；写入变更日志。
+
+        返回 'added' 或 'skipped'。
+        """
+        universe = await StockPaperDao.get_universe_by_code(db, account_id, code)
+        if universe is not None and universe.status == 'active':
+            return 'skipped'
+        values: dict[str, Any] = {
+            'source_type': source_type,
+            'source_batch_id': source_batch_id,
+            'status': 'active',
+        }
+        if name:
+            values['name'] = name
+        if universe is None:
+            await StockPaperDao.add_universe(db, StockPaperUniverse(account_id=account_id, code=code, **values))
+        else:
+            await StockPaperDao.update_universe_by_code(db, account_id, code, **values)
+        await StockPaperDao.add_universe_log(
+            db,
+            StockPaperUniverseLog(
+                account_id=account_id,
+                code=code,
+                action='add',
+                source_type=source_type,
+                source_ref=source_batch_id,
+            ),
+        )
+        return 'added'
+
+    @classmethod
+    async def add_to_universe(cls, db: AsyncSession, request: PaperUniverseAddRequestModel) -> dict[str, Any]:
+        """动态加入标的池：支持直接代码、整池加入（poolName）与从原始池勾选（poolCodes），幂等。"""
+        account = await cls._require_account(db, request.account_name)
+        codes: list[str] = list(request.codes)
+        name_map: dict[str, str | None] = {}
+        source_ref: str | None = None
+        if request.pool_codes:
+            if not request.pool_name:
+                raise ServiceException(message='poolCodes 必须与 poolName 同时提供')
+            pool_rows = await StockPoolDao.codes_by_pool(db, request.pool_name)
+            pool_map = dict(pool_rows)
+            if not pool_map:
+                raise ServiceException(message=f'股票池 {request.pool_name} 不存在或为空')
+            invalid_codes = [code for code in request.pool_codes if code not in pool_map]
+            if invalid_codes:
+                raise ServiceException(
+                    message=f'以下代码不在股票池 {request.pool_name} 中：{",".join(invalid_codes[:10])}'
+                )
+            source_ref = f'pool:{request.pool_name}'
+            for code in request.pool_codes:
+                if code not in name_map:
+                    name_map[code] = pool_map[code]
+            codes = list(dict.fromkeys(codes + request.pool_codes))
+        elif request.pool_name:
+            codes, pool_name_map, source_ref = await cls._resolve_pool_codes(db, request.pool_name, codes)
+            name_map.update(pool_name_map)
+        if not codes:
+            raise ServiceException(message='请至少提供一只股票（codes / poolName / poolCodes 三选一）')
+        source_type = 'pool' if source_ref else (request.source_type or 'manual')
+        missing_codes = [code for code in codes if code not in name_map]
+        name_map.update(cls._stock_names_from_mongo(missing_codes))
+
+        added_count = 0
+        skipped_count = 0
+        for code in codes:
+            if await cls._upsert_universe_one(
+                db, account.id, code, name_map.get(code), source_type, source_ref
+            ) == 'added':
+                added_count += 1
+            else:
+                skipped_count += 1
+        await db.commit()
+        logger.bind(
+            account_name=account.account_name,
+            added_count=added_count,
+            skipped_count=skipped_count,
+            source_type=source_type,
+        ).info('模拟盘标的池动态加入完成')
+        return {
+            'accountId': account.id,
+            'accountName': account.account_name,
+            'addedCount': added_count,
+            'skippedCount': skipped_count,
+        }
+
+    @classmethod
+    async def remove_from_universe(cls, db: AsyncSession, request: PaperUniverseRemoveRequestModel) -> dict[str, Any]:
+        """动态移出标的池（逻辑停用）；任一请求标的持仓中则整体拒绝，不做任何修改。"""
+        account = await cls._require_account(db, request.account_name)
+        requested = set(request.codes)
+        held_codes = await StockPaperDao.get_held_codes(db, account.id)
+        held_intersection = sorted(requested & held_codes)
+        if held_intersection:
+            raise ServiceException(message=f'以下标的持仓中，不允许移出：{",".join(held_intersection)}')
+        removable: list[str] = []
+        for code in sorted(requested):
+            universe = await StockPaperDao.get_universe_by_code(db, account.id, code)
+            if universe is not None and universe.status == 'active':
+                removable.append(code)
+        if not removable:
+            raise ServiceException(message='请求的标的均不在当前标的池中')
+        await StockPaperDao.deactivate_universe_codes(db, account.id, removable)
+        for code in removable:
+            await StockPaperDao.add_universe_log(
+                db,
+                StockPaperUniverseLog(
+                    account_id=account.id, code=code, action='remove', source_type='api', source_ref=None
+                ),
+            )
+        await db.commit()
+        logger.bind(account_name=account.account_name, removed_count=len(removable)).info('模拟盘标的池动态移出完成')
+        return {
+            'accountId': account.id,
+            'accountName': account.account_name,
+            'removedCount': len(removable),
+        }
+
+    @classmethod
+    async def list_universe_logs(
+        cls, db: AsyncSession, account_name: str, code: str | None, page_num: int, page_size: int
+    ) -> PageModel:
+        """分页返回标的池加入/移出变更日志。"""
+        account = await cls._require_account(db, account_name)
+        return await StockPaperDao.list_universe_logs(db, account.id, code, page_num, page_size)
+
     # ---------------------------------------------------------------- 勾选入池
     @classmethod
     async def ensure_account(
-        cls, db: AsyncSession, strategy_name: str | None = None, initial_cash: int = 1_000_000
+        cls,
+        db: AsyncSession,
+        strategy_name: str | None = None,
+        initial_cash: int = 1_000_000,
+        account_name: str = DEFAULT_ACCOUNT_NAME,
     ) -> StockPaperAccount:
-        """确保系统级默认账户存在，缺少时按回测批次参数兜底创建。"""
-        account = await StockPaperDao.get_account(db, DEFAULT_ACCOUNT_NAME)
+        '''确保指定账户存在，缺少时按回测批次参数兜底创建。'''
+        account = await StockPaperDao.get_account(db, account_name)
         if account is not None:
             return account
         account = StockPaperAccount(
-            account_name=DEFAULT_ACCOUNT_NAME,
+            account_name=account_name,
             strategy_name=strategy_name,
             initial_cash=initial_cash,
             cash=float(initial_cash),
@@ -1271,37 +1665,27 @@ class StockPaperService:
         return account
 
     @classmethod
-    async def pick_to_universe(cls, db: AsyncSession, batch_id: str, codes: list[str]) -> dict[str, Any]:
-        """批量回测结果的勾选标的写入模拟盘标的池，返回新增/跳过数量。"""
+    async def pick_to_universe(
+        cls, db: AsyncSession, batch_id: str, codes: list[str], account_name: str = DEFAULT_ACCOUNT_NAME
+    ) -> dict[str, Any]:
+        '''批量回测结果的勾选标的写入指定模拟盘账户标的池，返回新增/跳过数量。'''
         if not codes:
             raise ServiceException(message='请至少勾选一只股票')
         batch = await StockScanDao.get_batch(db, batch_id)
         if batch is None:
             raise ServiceException(message='批量回测批次不存在')
         items = {item.code: item for item in await StockScanDao.get_items_for_codes(db, batch_id, codes)}
-        account = await cls.ensure_account(db, batch.strategy_name, batch.initial_cash)
+        account = await cls.ensure_account(db, batch.strategy_name, batch.initial_cash, account_name)
 
         added_count = 0
         skipped_count = 0
         for code in codes:
-            universe = await StockPaperDao.get_universe_by_code(db, account.id, code)
             item = items.get(code)
-            name = item.name if item is not None else (universe.name if universe is not None else None)
-            if universe is not None and universe.status == 'active':
-                skipped_count += 1
-                continue
-            if universe is None:
-                await StockPaperDao.add_universe(
-                    db,
-                    StockPaperUniverse(
-                        account_id=account.id, code=code, name=name, source_batch_id=batch_id, status='active'
-                    ),
-                )
+            name = item.name if item is not None else None
+            if await cls._upsert_universe_one(db, account.id, code, name, 'scan_pick', batch_id) == 'added':
+                added_count += 1
             else:
-                await StockPaperDao.update_universe_by_code(
-                    db, account.id, code, name=name, source_batch_id=batch_id, status='active'
-                )
-            added_count += 1
+                skipped_count += 1
         await db.commit()
         logger.bind(
             batch_id=batch_id, account_id=account.id, added_count=added_count, skipped_count=skipped_count

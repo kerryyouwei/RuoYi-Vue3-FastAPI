@@ -9,8 +9,13 @@ from pydantic import ValidationError
 
 from exceptions.exception import ServiceException
 from module_stock.dao.stock_paper_dao import StockPaperDao
+from module_stock.dao.stock_pool_dao import StockPoolDao
 from module_stock.dao.stock_scan_dao import StockScanDao
-from module_stock.entity.vo.stock_paper_vo import PaperAccountInitRequestModel
+from module_stock.entity.vo.stock_paper_vo import (
+    PaperAccountInitRequestModel,
+    PaperUniverseAddRequestModel,
+    PaperUniverseRemoveRequestModel,
+)
 from module_stock.service import stock_paper_service as paper_service_module
 from module_stock.service.stock_paper_service import (
     COMMISSION_RATE,
@@ -63,8 +68,8 @@ def test_paper_init_request_dedupes_codes() -> None:
 
     with pytest.raises(ValidationError):
         PaperAccountInitRequestModel(strategyName='ma', codes=['ABC'])
-    with pytest.raises(ValidationError):
-        PaperAccountInitRequestModel(strategyName='ma', codes=[])
+    # codes 为空合法：保留现有标的池，仅重置资金与交易记录
+    assert PaperAccountInitRequestModel(strategyName='ma').codes == []
 
 
 @pytest.mark.asyncio
@@ -106,8 +111,14 @@ async def test_init_account_resets_and_rewrites_universe(monkeypatch: pytest.Mon
         created_universes.append(universe)
         return universe
 
-    async def fake_deactivate(db: Any, account_id: int, codes: set[str]) -> None:
-        deactivated.append(codes)
+    async def fake_deactivate(db: Any, account_id: int, codes: set[str], skip_held: set[str] | None = None) -> None:
+        deactivated.append((codes, skip_held))
+
+    async def fake_get_held_codes(db: Any, account_id: int) -> set[str]:
+        return set()
+
+    async def fake_add_universe_log(db: Any, log: Any) -> Any:
+        return log
 
     monkeypatch.setattr(
         'module_stock.service.stock_paper_service.StockStrategyService._file',
@@ -123,6 +134,8 @@ async def test_init_account_resets_and_rewrites_universe(monkeypatch: pytest.Mon
     monkeypatch.setattr(StockPaperDao, 'get_universe_by_code', fake_get_universe_by_code)
     monkeypatch.setattr(StockPaperDao, 'add_universe', fake_add_universe)
     monkeypatch.setattr(StockPaperDao, 'deactivate_universe_except', fake_deactivate)
+    monkeypatch.setattr(StockPaperDao, 'get_held_codes', fake_get_held_codes)
+    monkeypatch.setattr(StockPaperDao, 'add_universe_log', fake_add_universe_log)
 
     request = PaperAccountInitRequestModel(
         strategyName='ma', initialCash=500000, codes=['000001', '600519', '000001'],
@@ -130,12 +143,69 @@ async def test_init_account_resets_and_rewrites_universe(monkeypatch: pytest.Mon
     result = await StockPaperService.init_account(FakeDb(), request)
 
     assert result['addedCount'] == 2
-    assert result['skippedCount'] == 1
+    # 请求模型层已对 codes 去重，服务层不会出现重复输入
+    assert result['skippedCount'] == 0
     assert account.cash == 500000.0
     assert updated_account['initial_cash'] == 500000
     assert deleted == {'positions': 1, 'orders': 1, 'signals': 1, 'snapshots': 1}
     assert {u.code for u in created_universes} == {'000001', '600519'}
-    assert deactivated == [{'000001', '600519'}]
+    # 默认非 replace：不再全量停用既有标的池
+    assert deactivated == []
+
+
+@pytest.mark.asyncio
+async def test_init_account_replace_deactivates_except_held(monkeypatch: pytest.MonkeyPatch) -> None:
+    """replace=true 时全量重置标的池，但持仓中的标的不会被停用。"""
+    account = _make_account()
+
+    async def fake_get_account(db: Any, name: str) -> Any:
+        return account
+
+    async def fake_get_held_codes(db: Any, account_id: int) -> set[str]:
+        return {'600519'}
+
+    deactivated: list[tuple[set[str], set[str] | None]] = []
+
+    async def fake_deactivate(db: Any, account_id: int, codes: set[str], skip_held: set[str] | None = None) -> None:
+        deactivated.append((codes, skip_held))
+
+    async def fake_noop(db: Any, account_id: int) -> None:
+        return None
+
+    async def fake_get_universe_by_code(db: Any, account_id: int, code: str) -> Any:
+        return None
+
+    async def fake_add_universe(db: Any, universe: Any) -> Any:
+        return universe
+
+    async def fake_add_universe_log(db: Any, log: Any) -> Any:
+        return log
+
+    monkeypatch.setattr(
+        'module_stock.service.stock_paper_service.StockStrategyService._file',
+        staticmethod(lambda name: SimpleNamespace()),
+    )
+    async def fake_update_account(db: Any, account_id: int, **values: Any) -> None:
+        return None
+
+    monkeypatch.setattr(StockPaperDao, 'get_account', fake_get_account)
+    monkeypatch.setattr(StockPaperDao, 'update_account', fake_update_account)
+    monkeypatch.setattr(StockPaperDao, 'delete_positions_by_account', fake_noop)
+    monkeypatch.setattr(StockPaperDao, 'delete_orders_by_account', fake_noop)
+    monkeypatch.setattr(StockPaperDao, 'delete_signals_by_account', fake_noop)
+    monkeypatch.setattr(StockPaperDao, 'delete_snapshots_by_account', fake_noop)
+    monkeypatch.setattr(StockPaperDao, 'get_held_codes', fake_get_held_codes)
+    monkeypatch.setattr(StockPaperDao, 'get_universe_by_code', fake_get_universe_by_code)
+    monkeypatch.setattr(StockPaperDao, 'add_universe', fake_add_universe)
+    monkeypatch.setattr(StockPaperDao, 'deactivate_universe_except', fake_deactivate)
+    monkeypatch.setattr(StockPaperDao, 'add_universe_log', fake_add_universe_log)
+
+    request = PaperAccountInitRequestModel(
+        strategyName='ma', codes=['000001', '600519'], replace=True,
+    )
+    await StockPaperService.init_account(FakeDb(), request)
+
+    assert deactivated == [({'000001', '600519'}, {'600519'})]
 
 
 @pytest.mark.asyncio
@@ -182,8 +252,9 @@ async def test_get_account_requires_initialization(monkeypatch: pytest.MonkeyPat
         return None
 
     monkeypatch.setattr(StockPaperDao, 'get_account', fake_get_account)
-    with pytest.raises(ServiceException, match='尚未初始化'):
+    with pytest.raises(ServiceException) as exc_info:
         await StockPaperService.get_account(FakeDb())
+    assert exc_info.value.message and '尚未初始化' in exc_info.value.message
 
 
 @pytest.mark.asyncio
@@ -212,10 +283,14 @@ async def test_execute_buy_lot_sizing_and_cash_check(monkeypatch: pytest.MonkeyP
     async def fake_mark_skipped(db: Any, account_id: int, sig: Any, name: Any, price: Any, reason: str) -> None:
         updated_signal_status[sig.id] = 'skipped'
 
+    async def fake_get_position_by_code(db: Any, account_id: int, code: str) -> Any:
+        return None
+
     monkeypatch.setattr(StockPaperDao, 'update_account', fake_update_account)
     monkeypatch.setattr(StockPaperDao, 'create_position', fake_create_position)
     monkeypatch.setattr(StockPaperDao, 'create_order', fake_create_order)
     monkeypatch.setattr(StockPaperDao, 'update_signal', fake_update_signal)
+    monkeypatch.setattr(StockPaperDao, 'get_position_by_code', fake_get_position_by_code)
     monkeypatch.setattr(StockPaperService, '_mark_skipped', fake_mark_skipped)
 
     # 等权 target=100000/1=100000, price=10, lot=100股 -> quantity=10000, amount=100000 > cash=50000 -> skip
@@ -239,6 +314,7 @@ async def test_execute_buy_lot_sizing_and_cash_check(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(StockPaperDao, 'create_order', fake_create_order2)
     monkeypatch.setattr(StockPaperDao, 'update_signal', fake_update_signal2)
+    monkeypatch.setattr(StockPaperDao, 'get_position_by_code', fake_get_position_by_code)
     monkeypatch.setattr(StockPaperService, '_mark_skipped', fake_mark_skipped)
 
     await StockPaperService._execute_buy(FakeDb(), account2, signal, '平安银行', positions2, 100_000.0, 1, 10.0)
@@ -264,7 +340,11 @@ async def test_execute_sell_t_plus_1_and_fees(monkeypatch: pytest.MonkeyPatch) -
     async def fake_mark_skipped(db: Any, account_id: int, sig: Any, name: Any, price: Any, reason: str) -> None:
         skipped_calls.append(reason)
 
+    async def fake_get_position_by_code(db: Any, account_id: int, code: str) -> Any:
+        return None
+
     monkeypatch.setattr(StockPaperService, '_mark_skipped', fake_mark_skipped)
+    monkeypatch.setattr(StockPaperDao, 'get_position_by_code', fake_get_position_by_code)
     await StockPaperService._execute_sell(FakeDb(), account, signal, '平安银行', positions, 12.0)
     assert len(skipped_calls) == 1
     assert 'T+1' in skipped_calls[0] or '可卖' in skipped_calls[0]
@@ -284,10 +364,14 @@ async def test_execute_sell_t_plus_1_and_fees(monkeypatch: pytest.MonkeyPatch) -
     async def fake_update_signal(db: Any, signal_id: int, **values: Any) -> None:
         pass
 
+    async def fake_get_db_position(db: Any, account_id: int, code: str) -> Any:
+        return positions2.get(code)
+
     monkeypatch.setattr(StockPaperDao, 'create_order', fake_create_order)
     monkeypatch.setattr(StockPaperDao, 'delete_positions_by_code', fake_delete_positions)
     monkeypatch.setattr(StockPaperDao, 'update_signal', fake_update_signal)
     monkeypatch.setattr(StockPaperDao, 'update_account', AsyncMock())
+    monkeypatch.setattr(StockPaperDao, 'get_position_by_code', fake_get_db_position)
     monkeypatch.setattr(StockPaperService, '_mark_skipped', fake_mark_skipped)
 
     await StockPaperService._execute_sell(FakeDb(), account, signal, '平安银行', positions2, 12.0)
@@ -331,7 +415,7 @@ async def test_pick_to_universe(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_get_items_for_codes(db: Any, batch_id: str, codes: list[str]) -> list[Any]:
         return [i for i in items if i.code in codes]
 
-    async def fake_ensure(db: Any, strategy_name: str, initial_cash: int) -> Any:
+    async def fake_ensure(db: Any, strategy_name: str, initial_cash: int, account_name: str) -> Any:
         return account
 
     async def fake_get_universe_by_code(db: Any, account_id: int, code: str) -> Any:
@@ -345,12 +429,16 @@ async def test_pick_to_universe(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_update(db: Any, account_id: int, code: str, **values: Any) -> None:
         existing_universe[code] = SimpleNamespace(code=code, status='active', **values)
 
+    async def fake_add_universe_log(db: Any, log: Any) -> Any:
+        return log
+
     monkeypatch.setattr(StockScanDao, 'get_batch', fake_get_batch)
     monkeypatch.setattr(StockScanDao, 'get_items_for_codes', fake_get_items_for_codes)
     monkeypatch.setattr(StockPaperService, 'ensure_account', fake_ensure)
     monkeypatch.setattr(StockPaperDao, 'get_universe_by_code', fake_get_universe_by_code)
     monkeypatch.setattr(StockPaperDao, 'add_universe', fake_add)
     monkeypatch.setattr(StockPaperDao, 'update_universe_by_code', fake_update)
+    monkeypatch.setattr(StockPaperDao, 'add_universe_log', fake_add_universe_log)
 
     result = await StockPaperService.pick_to_universe(FakeDb(), 'b1', ['000001', '600519'])
     assert result['addedCount'] == 2
@@ -413,3 +501,190 @@ async def test_refresh_position_prices_keeps_cache_on_empty_quote(monkeypatch: p
 
     await StockPaperService._refresh_position_prices(FakeDb(), positions)
     assert position.last_price == 48.79
+
+
+# ---------------------------------------------------------------- 标的池动态增删
+
+
+def _make_universe(**changes: Any) -> SimpleNamespace:
+    defaults = {
+        'id': 100, 'account_id': 1, 'code': '600519', 'name': '贵州茅台',
+        'source_batch_id': None, 'source_type': 'manual', 'status': 'active',
+    }
+    defaults.update(changes)
+    return SimpleNamespace(**defaults)
+
+
+def _patch_universe_daos(
+    monkeypatch: pytest.MonkeyPatch,
+    account: Any,
+    store: dict[str, Any],
+    logs: list[Any],
+    held_codes: set[str] | None = None,
+) -> None:
+    async def fake_get_account(db: Any, name: str) -> Any:
+        return account if name == account.account_name else None
+
+    async def fake_codes_by_pool(db: Any, pool_name: str) -> list[tuple[str, str | None]]:
+        if pool_name == 'mf_pool':
+            return [('600519', '贵州茅台'), ('000001', '平安银行')]
+        return []
+
+    async def fake_get_universe_by_code(db: Any, account_id: int, code: str) -> Any:
+        return store.get(code)
+
+    async def fake_add_universe(db: Any, universe: Any) -> Any:
+        store[universe.code] = universe
+        return universe
+
+    async def fake_update_universe_by_code(db: Any, account_id: int, code: str, **values: Any) -> None:
+        current = store.get(code) or SimpleNamespace(code=code)
+        for key, value in values.items():
+            setattr(current, key, value)
+        store[code] = current
+
+    async def fake_deactivate_universe_codes(db: Any, account_id: int, codes: Any) -> None:
+        for code in codes:
+            if code in store:
+                store[code].status = 'inactive'
+
+    async def fake_add_universe_log(db: Any, log: Any) -> Any:
+        logs.append(log)
+        return log
+
+    async def fake_get_held_codes(db: Any, account_id: int) -> set[str]:
+        return held_codes or set()
+
+    monkeypatch.setattr(StockPaperDao, 'get_account', fake_get_account)
+    monkeypatch.setattr(StockPoolDao, 'codes_by_pool', fake_codes_by_pool)
+    monkeypatch.setattr(StockPaperDao, 'get_universe_by_code', fake_get_universe_by_code)
+    monkeypatch.setattr(StockPaperDao, 'add_universe', fake_add_universe)
+    monkeypatch.setattr(StockPaperDao, 'update_universe_by_code', fake_update_universe_by_code)
+    monkeypatch.setattr(StockPaperDao, 'deactivate_universe_codes', fake_deactivate_universe_codes)
+    monkeypatch.setattr(StockPaperDao, 'add_universe_log', fake_add_universe_log)
+    monkeypatch.setattr(StockPaperDao, 'get_held_codes', fake_get_held_codes)
+
+
+@pytest.mark.asyncio
+async def test_add_to_universe_whole_pool_and_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    """整池加入写入 pool 来源与池名简称；重复加入幂等跳过；手工代码走 manual 来源并补名。"""
+    account = _make_account()
+    store: dict[str, Any] = {}
+    logs: list[Any] = []
+    _patch_universe_daos(monkeypatch, account, store, logs)
+
+    result = await StockPaperService.add_to_universe(FakeDb(), PaperUniverseAddRequestModel(poolName='mf_pool'))
+    assert result['addedCount'] == 2
+    assert result['skippedCount'] == 0
+    assert store['600519'].source_type == 'pool'
+    assert store['600519'].source_batch_id == 'pool:mf_pool'
+    assert store['600519'].name == '贵州茅台'
+    assert len(logs) == 2
+    assert all(log.action == 'add' and log.source_type == 'pool' for log in logs)
+
+    result2 = await StockPaperService.add_to_universe(FakeDb(), PaperUniverseAddRequestModel(poolName='mf_pool'))
+    assert result2['addedCount'] == 0
+    assert result2['skippedCount'] == 2
+    assert len(logs) == 2
+
+    monkeypatch.setattr(
+        StockPaperService, '_stock_names_from_mongo', staticmethod(lambda codes: {'300750': '宁德时代'})
+    )
+    result3 = await StockPaperService.add_to_universe(FakeDb(), PaperUniverseAddRequestModel(codes=['300750']))
+    assert result3['addedCount'] == 1
+    assert store['300750'].source_type == 'manual'
+    assert store['300750'].name == '宁德时代'
+
+
+@pytest.mark.asyncio
+async def test_add_to_universe_pool_codes_pick_and_reactivate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """从原始池勾选加入；已 inactive 的标的重新激活并覆盖来源。"""
+    account = _make_account()
+    store: dict[str, Any] = {'600519': _make_universe(status='inactive', source_type='manual')}
+    logs: list[Any] = []
+    _patch_universe_daos(monkeypatch, account, store, logs)
+
+    request = PaperUniverseAddRequestModel(poolName='mf_pool', poolCodes=['600519', '000001'])
+    result = await StockPaperService.add_to_universe(FakeDb(), request)
+    assert result['addedCount'] == 2
+    assert result['skippedCount'] == 0
+    assert store['600519'].status == 'active'
+    assert store['600519'].source_type == 'pool'
+    assert store['000001'].name == '平安银行'
+
+
+@pytest.mark.asyncio
+async def test_add_to_universe_validations(monkeypatch: pytest.MonkeyPatch) -> None:
+    account = _make_account()
+    store: dict[str, Any] = {}
+    logs: list[Any] = []
+    _patch_universe_daos(monkeypatch, account, store, logs)
+
+    async def _expect_add_error(request: Any, keyword: str) -> None:
+        with pytest.raises(ServiceException) as exc_info:
+            await StockPaperService.add_to_universe(FakeDb(), request)
+        assert exc_info.value.message and keyword in exc_info.value.message
+
+    await _expect_add_error(PaperUniverseAddRequestModel(poolCodes=['600519']), '同时提供')
+    await _expect_add_error(PaperUniverseAddRequestModel(poolName='empty_pool'), '不存在或为空')
+    await _expect_add_error(
+        PaperUniverseAddRequestModel(poolName='mf_pool', poolCodes=['999999']), '不在股票池'
+    )
+    await _expect_add_error(PaperUniverseAddRequestModel(), '三选一')
+    assert not store
+    assert not logs
+
+
+@pytest.mark.asyncio
+async def test_remove_from_universe_held_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """任一请求标的持仓中 → 整体拒绝且不做任何修改。"""
+    account = _make_account()
+    store: dict[str, Any] = {
+        '000001': _make_universe(code='000001', name='平安银行'),
+        '600519': _make_universe(),
+    }
+    logs: list[Any] = []
+    deactivated: list[Any] = []
+
+    async def fake_deactivate(db: Any, account_id: int, codes: Any) -> None:
+        deactivated.append(list(codes))
+
+    _patch_universe_daos(monkeypatch, account, store, logs, held_codes={'000001'})
+    monkeypatch.setattr(StockPaperDao, 'deactivate_universe_codes', fake_deactivate)
+
+    with pytest.raises(ServiceException) as exc_info:
+        await StockPaperService.remove_from_universe(
+            FakeDb(), PaperUniverseRemoveRequestModel(codes=['000001', '600519'])
+        )
+    assert exc_info.value.message and '持仓中' in exc_info.value.message
+    assert '000001' in exc_info.value.message
+    assert not deactivated
+    assert not logs
+    assert store['600519'].status == 'active'
+
+
+@pytest.mark.asyncio
+async def test_remove_from_universe_success_and_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """仅移出 active 标的并写日志；已移出/池外标的触发整体报错。"""
+    account = _make_account()
+    store: dict[str, Any] = {
+        '000001': _make_universe(code='000001', name='平安银行'),
+        '600519': _make_universe(status='inactive'),
+    }
+    logs: list[Any] = []
+    _patch_universe_daos(monkeypatch, account, store, logs)
+
+    result = await StockPaperService.remove_from_universe(
+        FakeDb(), PaperUniverseRemoveRequestModel(codes=['000001', '600519', '300999'])
+    )
+    assert result['removedCount'] == 1
+    assert store['000001'].status == 'inactive'
+    assert len(logs) == 1
+    assert logs[0].action == 'remove'
+    assert logs[0].source_type == 'api'
+
+    with pytest.raises(ServiceException) as exc_info:
+        await StockPaperService.remove_from_universe(
+            FakeDb(), PaperUniverseRemoveRequestModel(codes=['600519'])
+        )
+    assert exc_info.value.message and '均不在当前标的池' in exc_info.value.message

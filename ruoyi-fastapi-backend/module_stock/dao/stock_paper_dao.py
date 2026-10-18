@@ -12,6 +12,7 @@ from module_stock.entity.do.stock_paper_do import (
     StockPaperPosition,
     StockPaperSignal,
     StockPaperUniverse,
+    StockPaperUniverseLog,
 )
 from utils.page_util import PageUtil
 
@@ -29,6 +30,14 @@ class StockPaperDao:
         )
 
     @staticmethod
+    async def get_account_by_id(db: AsyncSession, account_id: int) -> StockPaperAccount | None:
+        return (
+            (await db.execute(select(StockPaperAccount).where(StockPaperAccount.id == account_id)))
+            .scalars()
+            .first()
+        )
+
+    @staticmethod
     async def create_account(db: AsyncSession, account: StockPaperAccount) -> StockPaperAccount:
         db.add(account)
         await db.flush()
@@ -37,6 +46,21 @@ class StockPaperDao:
     @staticmethod
     async def update_account(db: AsyncSession, account_id: int, **values: object) -> None:
         await db.execute(update(StockPaperAccount).where(StockPaperAccount.id == account_id).values(**values))
+
+    @staticmethod
+    async def delete_account(db: AsyncSession, account_id: int) -> None:
+        await db.execute(delete(StockPaperAccount).where(StockPaperAccount.id == account_id))
+
+    @staticmethod
+    async def delete_feishu_messages_by_account(db: AsyncSession, account_id: int) -> None:
+        await db.execute(delete(StockFeishuMessage).where(StockFeishuMessage.account_id == account_id))
+
+    @staticmethod
+    async def list_accounts(db: AsyncSession, status: str | None = None) -> list[StockPaperAccount]:
+        stmt = select(StockPaperAccount).order_by(StockPaperAccount.id)
+        if status:
+            stmt = stmt.where(StockPaperAccount.status == status)
+        return list((await db.execute(stmt)).scalars().all())
 
     # ---------------------------------------------------------------- universe
     @staticmethod
@@ -47,6 +71,69 @@ class StockPaperDao:
             .order_by(StockPaperUniverse.code)
         )
         return list(rows.scalars().all())
+
+    @staticmethod
+    async def list_universe(db: AsyncSession, account_id: int, status: str = 'active') -> list[StockPaperUniverse]:
+        """按状态返回标的池明细：active/inactive/all。"""
+        stmt = select(StockPaperUniverse).where(StockPaperUniverse.account_id == account_id)
+        if status != 'all':
+            stmt = stmt.where(StockPaperUniverse.status == status)
+        rows = await db.execute(stmt.order_by(StockPaperUniverse.code))
+        return list(rows.scalars().all())
+
+    @staticmethod
+    async def get_held_codes(db: AsyncSession, account_id: int) -> set[str]:
+        """返回账户中当前持仓数量大于 0 的股票代码集合。"""
+        rows = await db.execute(
+            select(StockPaperPosition.code).where(
+                StockPaperPosition.account_id == account_id,
+                StockPaperPosition.quantity > 0,
+            )
+        )
+        return {row[0] for row in rows.all()}
+
+    @staticmethod
+    async def deactivate_universe_codes(db: AsyncSession, account_id: int, codes: set[str] | list[str]) -> None:
+        """按代码批量停用标的池记录。"""
+        if not codes:
+            return
+        await db.execute(
+            update(StockPaperUniverse)
+            .where(StockPaperUniverse.account_id == account_id, StockPaperUniverse.code.in_(codes))
+            .values(status='inactive')
+        )
+
+    @staticmethod
+    async def add_universe_log(db: AsyncSession, log: StockPaperUniverseLog) -> StockPaperUniverseLog:
+        db.add(log)
+        await db.flush()
+        return log
+
+    @staticmethod
+    async def list_universe_logs(
+        db: AsyncSession, account_id: int, code: str | None, page_num: int, page_size: int
+    ) -> PageModel:
+        stmt = select(StockPaperUniverseLog).where(StockPaperUniverseLog.account_id == account_id)
+        if code:
+            stmt = stmt.where(StockPaperUniverseLog.code == code)
+        stmt = stmt.order_by(StockPaperUniverseLog.id.desc())
+        return await PageUtil.paginate(db, stmt, page_num, page_size, True)
+
+    @staticmethod
+    async def list_universe_codes_all_accounts(db: AsyncSession) -> list[tuple[str, str | None]]:
+        """返回所有账户active标的池去重后的（代码, 简称）列表。"""
+        rows = (
+            await db.execute(
+                select(StockPaperUniverse.code, StockPaperUniverse.name)
+                .where(StockPaperUniverse.status == 'active')
+                .order_by(StockPaperUniverse.code)
+            )
+        ).all()
+        seen: dict[str, str | None] = {}
+        for code, name in rows:
+            if code not in seen or seen[code] is None:
+                seen[code] = name
+        return [(code, seen[code]) for code in sorted(seen)]
 
     @staticmethod
     async def get_universe_by_code(db: AsyncSession, account_id: int, code: str) -> StockPaperUniverse | None:
@@ -76,10 +163,14 @@ class StockPaperDao:
             .values(**values)
         )
 
-    async def deactivate_universe_except(self: AsyncSession, account_id: int, codes: set[str]) -> None:
+    async def deactivate_universe_except(
+        self: AsyncSession, account_id: int, codes: set[str], skip_held: set[str] | None = None
+    ) -> None:
         stmt = update(StockPaperUniverse).where(StockPaperUniverse.account_id == account_id).values(status='inactive')
         if codes:
             stmt = stmt.where(StockPaperUniverse.code.not_in(codes))
+        if skip_held:
+            stmt = stmt.where(StockPaperUniverse.code.not_in(skip_held))
         await self.execute(stmt)
 
     async def delete_universe_by_account(self: AsyncSession, account_id: int) -> None:

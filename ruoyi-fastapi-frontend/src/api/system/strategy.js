@@ -5,6 +5,7 @@ export const getStrategy = (strategyName) => request({ url: `/stock/strategy/${s
 export const runStrategy = (data) => request({ url: '/stock/strategy/run', method: 'post', data })
 export const getRunStatus = (runId) => request({ url: `/stock/strategy/run/${runId}`, method: 'get' })
 export const getRunDetail = (runId) => request({ url: `/stock/strategy/run/${runId}/detail`, method: 'get' })
+export const getRunTrades = (runId, params) => request({ url: `/stock/strategy/run/${runId}/trades`, method: 'get', params })
 export const getStrategyHistory = (strategyName, params) => request({ url: `/stock/strategy/${strategyName}/history`, method: 'get', params })
 export const validateStrategy = (data) => request({ url: '/stock/strategy/validate', method: 'post', data })
 export const getValidationStatus = (validationId) => request({ url: `/stock/strategy/validation/${validationId}`, method: 'get' })
