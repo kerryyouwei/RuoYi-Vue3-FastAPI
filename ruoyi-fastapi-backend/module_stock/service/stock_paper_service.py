@@ -197,6 +197,17 @@ class StockPaperService:
         return datetime.now(TimezoneUtil.get_app_timezone()).strftime('%H:%M:%S')
 
     @staticmethod
+    def _signal_time(value: Any) -> str | None:
+        """将信号创建时间转换为业务时区下的时分秒。"""
+        if not value:
+            return None
+        try:
+            create_time = value if value.tzinfo is not None else value.replace(tzinfo=TimezoneUtil.utc_now().tzinfo)
+            return TimezoneUtil.to_business_time(create_time).strftime('%H:%M:%S')
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _stock_names_from_mongo(codes: list[str]) -> dict[str, str]:
         """从 MongoDB stock_list 集合查询股票名称映射。"""
         try:
@@ -634,6 +645,8 @@ class StockPaperService:
         account = await cls._require_account(db, account_name)
         page = await StockPaperDao.list_signals(db, account.id, page_num, page_size)
         cls._fill_page_names(page)
+        for row in page.rows:
+            row['signalTime'] = cls._signal_time(row.get('createTime'))
         return page
 
     @classmethod

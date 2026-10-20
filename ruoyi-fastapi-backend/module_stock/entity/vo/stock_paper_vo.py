@@ -246,6 +246,7 @@ class PaperSignalModel(PaperBaseModel):
     reason: str | None = None
     close_price: float | None = None
     execute_date: str | None = None
+    signal_time: str | None = None
     status: str
 
 

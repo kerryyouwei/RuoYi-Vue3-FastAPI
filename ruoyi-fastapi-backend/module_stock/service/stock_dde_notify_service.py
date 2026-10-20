@@ -4,16 +4,25 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import anyio
+import httpx
 
 from config.database import DataSourceRegistry
 from module_stock.dao.stock_paper_dao import StockPaperDao
 from module_stock.service.stock_feishu_notification_service import FeishuNotificationService
-from module_stock.service.stock_selector_service import StockSelectorService
 from utils.log_util import logger
 from utils.time_util import TimezoneUtil
 
-_QUERY_TIMEOUT_SECONDS = 60
+_EASTMONEY_ULIST_URL = 'https://push2.eastmoney.com/api/qt/ulist.np/get'
+_EASTMONEY_UT = 'b2884a393a59ad64002292a3e90d46a5'
+_EASTMONEY_FIELDS = 'f12,f14,f2,f3,f20,f21,f72'
+_EASTMONEY_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+    ),
+    'Referer': 'https://data.eastmoney.com/zjlx/detail.html',
+}
+_QUERY_TIMEOUT_SECONDS = 10.0
 _TOP_DEFAULT = 30
 _CHUNK_SIZE = 100
 TRADING_DAY_MAX_WEEKDAY = 5
@@ -25,22 +34,16 @@ class DDEStockRow:
 
     code: str
     name: str
-    industry: str
-    concepts: str
     price: float | None
     pct_change: float | None
     large_net: float | None
     market_cap: float | None
     strength: float | None
-    institution_count: int | None
-    trend_concepts: str
-    big_institution_count: int | None
-    linkage: str
     limit_up: bool = False
 
 
 class StockDDENotifyService:
-    """读取全账户标的池、拉取同花顺问财DDE指标并推送飞书卡片。"""
+    """读取全账户标的池、拉取东方财富大单资金指标并推送飞书卡片。"""
 
     @classmethod
     async def send_pool_dde_notification(cls, pool_name: str = 'default', top_n: int = _TOP_DEFAULT, force: bool = False) -> dict[str, Any]:
@@ -67,7 +70,7 @@ class StockDDENotifyService:
         codes = [code for code, _ in pool_codes]
         candidate_count = len(codes)
         raw_rows = await cls._fetch_market_rows(codes)
-        logger.info('DDE问财原始行数 candidate_count={} raw_row_count={}', candidate_count, len(raw_rows))
+        logger.info('DDE东财原始行数 candidate_count={} raw_row_count={}', candidate_count, len(raw_rows))
         rows = cls._normalize_rows(raw_rows, pool_codes)
         logger.info('DDE清洗后行数 normalized_row_count={}', len(rows))
         if not rows:
@@ -117,47 +120,67 @@ class StockDDENotifyService:
 
     @classmethod
     async def _fetch_market_rows(cls, codes: list[str]) -> list[dict[str, Any]]:
-        """分批调用问财接口并合并返回记录。"""
+        """分批调用东方财富行情接口并合并返回记录。"""
         results: list[dict[str, Any]] = []
         for offset in range(0, len(codes), _CHUNK_SIZE):
             chunk = codes[offset : offset + _CHUNK_SIZE]
-            query = cls._build_query(chunk)
+            params = {
+                'secids': ','.join(cls._to_secid(code) for code in chunk),
+                'fields': _EASTMONEY_FIELDS,
+                'ut': _EASTMONEY_UT,
+                'fltt': '2',
+                'invt': '2',
+                'pn': '1',
+                'pz': str(len(chunk)),
+                'po': '1',
+                'np': '1',
+                'fid': 'f3',
+            }
             try:
-                raw_result = await anyio.to_thread.run_sync(
-                    lambda q=query, size=len(chunk): StockSelectorService._load_selector_module().query_astock(
-                        query=q,
-                        page=1,
-                        limit=size,
-                        timeout=_QUERY_TIMEOUT_SECONDS,
-                    )
-                )
-            except Exception:
-                logger.bind(pool_codes=chunk).exception('问财DDE查询失败')
+                async with httpx.AsyncClient(
+                    timeout=_QUERY_TIMEOUT_SECONDS,
+                    headers=_EASTMONEY_HEADERS,
+                ) as client:
+                    response = await client.get(_EASTMONEY_ULIST_URL, params=params)
+                    response.raise_for_status()
+                    payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                logger.bind(pool_codes=chunk).exception('东方财富DDE查询失败')
                 continue
-            if not isinstance(raw_result, dict):
-                logger.bind(pool_codes=chunk).warning('问财DDE查询返回格式异常')
+            rows = cls._extract_response_rows(payload)
+            if rows is None:
+                logger.bind(pool_codes=chunk).warning('东方财富DDE查询返回格式异常')
                 continue
-            datas = raw_result.get('datas') or []
-            if isinstance(datas, list):
-                logger.info('DDE问财返回行数 returned_row_count={} code_count={} row_count={} status_code={} raw_result_keys={} pool_codes={}', len(datas), raw_result.get('code_count'), raw_result.get('row_count'), raw_result.get('status_code'), list(raw_result.keys()), chunk)
-                results.extend(item for item in datas if isinstance(item, dict))
-            else:
-                logger.bind(pool_codes=chunk).warning('问财DDE查询缺少有效datas字段')
+            logger.bind(pool_codes=chunk).info('DDE东财返回行数 returned_row_count={}', len(rows))
+            results.extend(rows)
         return results
 
-    @classmethod
-    def _build_query(cls, codes: list[str]) -> str:
-        """构造一次查询全量展示指标的问财问句。"""
-        return (
-            f"{' '.join(codes)} DDE大单净额 最新价 当日涨跌幅 总市值 流通市值 "
-            '股东机构数量 行业 所属概念 走势概念 大机构 联动'
-        )
+    @staticmethod
+    def _extract_response_rows(payload: Any) -> list[dict[str, Any]] | None:
+        """提取东方财富 ulist.np/get 的 diff 数组。"""
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get('data')
+        if not isinstance(data, dict):
+            return None
+        diff = data.get('diff')
+        if isinstance(diff, list):
+            return [item for item in diff if isinstance(item, dict)]
+        if isinstance(diff, dict):
+            return [item for item in diff.values() if isinstance(item, dict)]
+        return None
+
+    @staticmethod
+    def _to_secid(code: str) -> str:
+        """将6位股票代码转换为东方财富 secid。"""
+        normalized = str(code).strip().zfill(6)
+        return f'1.{normalized}' if normalized.startswith('6') else f'0.{normalized}'
 
     @classmethod
     def _normalize_rows(
         cls, raw_rows: list[dict[str, Any]], pool_codes: list[tuple[str, str | None]]
     ) -> list[DDEStockRow]:
-        """清洗问财返回值，并按股票池代码顺序去重。"""
+        """清洗东财返回值，并按股票池代码顺序去重。"""
         by_code: dict[str, DDEStockRow] = {}
         pool_names = dict(pool_codes)
         for raw in raw_rows:
@@ -169,36 +192,27 @@ class StockDDENotifyService:
 
     @classmethod
     def _normalize_row(cls, raw: dict[str, Any], pool_names: dict[str, str | None]) -> DDEStockRow | None:
-        code_value = str(raw.get('股票代码') or '')
+        code_value = str(raw.get('f12') or '')
         code = code_value.split('.', 1)[0].strip()
         if code.isdigit():
             code = code.zfill(6)
         if code not in pool_names:
             return None
 
-        name = str(raw.get('股票简称') or pool_names.get(code) or '')
-        price = cls._number(raw, ('最新价', '收盘价'))
-        pct_change = cls._number(raw, ('涨跌幅',))
-        large_net = cls._number(raw, ('大单净额',))
-        market_cap = cls._market_cap(raw)
+        name = str(raw.get('f14') or pool_names.get(code) or '')
+        price = cls._to_float(raw.get('f2'))
+        pct_change = cls._to_float(raw.get('f3'))
+        large_net = cls._to_float(raw.get('f72'))
+        market_cap = cls._to_float(raw.get('f20')) or cls._to_float(raw.get('f21'))
         strength = (large_net / market_cap * 100.0) if large_net is not None and market_cap else None
-        institution_count = cls._optional_int(raw, ('机构股东家数', '股东机构数量', '机构家数'), exclude=('大机构',))
-        big_institution_count = cls._optional_int(raw, ('大机构', '大股东机构数量', '大单机构'))
-        concepts = cls._text(raw, ('所属概念', '概念'))
         return DDEStockRow(
             code=code,
             name=name,
-            industry=cls._text(raw, ('行业',)) or '—',
-            concepts=concepts or '—',
             price=price,
             pct_change=pct_change,
             large_net=large_net,
             market_cap=market_cap,
             strength=strength,
-            institution_count=institution_count,
-            trend_concepts=cls._text(raw, ('走势概念',)) or concepts or '—',
-            big_institution_count=big_institution_count,
-            linkage=cls._text(raw, ('联动',)) or '—',
             limit_up=cls._is_limit_up(code, name, pct_change),
         )
 
@@ -227,12 +241,10 @@ class StockDDENotifyService:
         if inflow_rows:
             lines.append('')
             lines.append(f'**资金流入 Top{top_n}**')
-            lines.append('每只股票一行展示完整指标')
             lines.extend(cls._format_row(index, row, period) for index, row in enumerate(inflow_rows, start=1))
         if outflow_rows:
             lines.append('')
             lines.append(f'**资金流出 Top{top_n}**')
-            lines.append('每只股票一行展示完整指标')
             lines.extend(cls._format_row(index, row, period) for index, row in enumerate(outflow_rows, start=1))
         return {
             'config': {'wide_screen_mode': True},
@@ -246,11 +258,10 @@ class StockDDENotifyService:
     @classmethod
     def _format_row(cls, index: int, row: DDEStockRow, period: str) -> str:
         return (
-            f"#{index} {row.name}（{row.code}）｜行业 {row.industry}｜概念 {row.concepts}｜时段 {period}｜"
+            f"#{index} {row.name}（{row.code}）｜时段 {period}｜"
             f'买入价 {cls._plain_number(row.price, 2)}｜涨跌幅 {cls._signed_number(row.pct_change, "%", 2)}｜'
             f'大单净额 {cls._signed_yi(row.large_net)}｜强度 {cls._signed_number(row.strength, "%", 2)}｜'
-            f'市值 {cls._yi(row.market_cap)}｜机构 {cls._display_int(row.institution_count)}｜'
-            f'走势概念 {row.trend_concepts}｜大机构 {cls._display_int(row.big_institution_count)}｜联动：{row.linkage}'
+            f'市值 {cls._yi(row.market_cap)}'
         )
 
     @classmethod
@@ -286,68 +297,23 @@ class StockDDENotifyService:
             threshold = 9.9
         return pct_change >= threshold
 
-    @classmethod
-    def _market_cap(cls, raw: dict[str, Any]) -> float | None:
-        total = cls._number(raw, ('总市值',))
-        if total is not None:
-            return total
-        return cls._number(raw, ('流通市值',))
-
-    @classmethod
-    def _number(cls, raw: dict[str, Any], prefixes: tuple[str, ...]) -> float | None:
-        for prefix in prefixes:
-            value = cls._select_value(raw, prefix)
-            parsed = cls._to_float(value)
-            if parsed is not None:
-                return parsed
-        return None
-
-    @classmethod
-    def _optional_int(
-        cls, raw: dict[str, Any], prefixes: tuple[str, ...], exclude: tuple[str, ...] = ()
-    ) -> int | None:
-        for prefix in prefixes:
-            value = cls._select_value(raw, prefix, exclude)
-            parsed = cls._to_float(value)
-            if parsed is not None:
-                return int(parsed)
-        return None
-
-    @classmethod
-    def _text(cls, raw: dict[str, Any], prefixes: tuple[str, ...]) -> str:
-        for prefix in prefixes:
-            value = cls._select_value(raw, prefix)
-            text = cls._join_text(value)
-            if text:
-                return text
-        return ''
-
-    @classmethod
-    def _select_value(cls, raw: dict[str, Any], prefix: str, exclude_prefixes: tuple[str, ...] = ()) -> Any:
-        return next((raw[key] for key in raw if cls._field_matches(key, prefix, exclude_prefixes)), None)
-
-    @staticmethod
-    def _field_matches(key: str, prefix: str, exclude_prefixes: tuple[str, ...]) -> bool:
-        if any(exclusion in key for exclusion in exclude_prefixes):
-            return False
-        return key == prefix or key.startswith(prefix)
-
     @staticmethod
     def _to_float(value: Any) -> float | None:
+        """容错解析东方财富数值字段。"""
         if value is None or isinstance(value, (list, dict)):
             return None
+        if isinstance(value, str):
+            text = value.strip().replace(',', '').replace('%', '').replace(' ', '')
+            if text in {'', '--', '-', '—'}:
+                return None
+            try:
+                return float(text)
+            except (TypeError, ValueError):
+                return None
         try:
             return float(value)
         except (TypeError, ValueError):
             return None
-
-    @staticmethod
-    def _join_text(value: Any) -> str:
-        if value is None:
-            return ''
-        if isinstance(value, list):
-            return '、'.join(str(item).strip() for item in value if str(item).strip())
-        return str(value).strip()
 
     @staticmethod
     def _signed_number(value: float | None, suffix: str, digits: int) -> str:
@@ -373,7 +339,3 @@ class StockDDENotifyService:
     @staticmethod
     def _yi(value: float | None) -> str:
         return '—' if value is None else f'{value / 100_000_000:.0f}亿'
-
-    @staticmethod
-    def _display_int(value: int | None) -> str:
-        return '—' if value is None else str(value)

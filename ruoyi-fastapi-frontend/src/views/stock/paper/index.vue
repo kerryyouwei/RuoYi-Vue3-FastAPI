@@ -132,6 +132,7 @@
       <template #header><div class="card-header"><span>今日信号 / 明日开盘计划</span></div></template>
       <el-table v-loading="signalsLoading" :data="signals" stripe>
         <el-table-column label="信号日期" prop="signalDate" width="110" align="center" />
+        <el-table-column label="信号时间" prop="signalTime" width="90" align="center" />
         <el-table-column label="执行日期" prop="executeDate" width="110" align="center" />
         <el-table-column label="股票代码" prop="code" width="110" align="center" />
         <el-table-column label="股票名称" prop="name" width="130" show-overflow-tooltip />
@@ -144,7 +145,7 @@
         <el-table-column label="原因" prop="reason" min-width="200" show-overflow-tooltip />
         <el-table-column label="状态" width="90" align="center">
           <template #default="{ row }">
-            <el-tag :type="signalStatusType(row.status)">{{ signalStatusLabel(row.status) }}</el-tag>
+            <el-tag :type="signalStatusType(row.status)">{{ signalStatusLabel(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="飞书通知" width="110" align="center">
@@ -482,7 +483,14 @@ const money = value => (value == null || !Number.isFinite(Number(value)) ? '—'
 const rate = value => (value == null ? '—' : `${(value * 100).toFixed(2)}%`)
 const pnlClass = computed(() => (account.value?.pnl >= 0 ? 'text-success' : 'text-danger'))
 const signalType = signal => ({ 买入: 'danger', 卖出: 'success', 持有: 'info' }[signal] || 'info')
-const signalStatusLabel = status => ({ pending: '待执行', executed: '已成交', skipped: '已跳过', expired: '已过期' }[status] || status)
+const signalStatusLabel = row => {
+  const status = row.status
+  if (status === 'pending') return '待执行'
+  if (status === 'executed') return row.signal === '持有' ? '已处理' : '已成交'
+  if (status === 'skipped') return '已跳过'
+  if (status === 'expired') return '已过期'
+  return status || '—'
+}
 const signalStatusType = status => ({ pending: 'warning', executed: 'success', skipped: 'info', expired: 'info' }[status] || 'info')
 const heldCodeSet = computed(() => new Set(positions.value.filter(item => item.quantity > 0).map(item => item.code)))
 const activeUniverseCodes = computed(() => new Set(universe.value.filter(item => item.status === 'active').map(item => item.code)))

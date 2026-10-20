@@ -1,4 +1,4 @@
-"""股票池 DDE 通知格式与问财数据清洗单元测试。"""
+"""股票池 DDE 通知格式与东方财富数据清洗单元测试。"""
 
 import json
 from typing import Any
@@ -24,22 +24,16 @@ def _row(
     return DDEStockRow(
         code=code,
         name=name,
-        industry='医药生物',
-        concepts='创新药、仿制药一致性评价',
         price=3.45,
         pct_change=pct_change,
         large_net=large_net,
         market_cap=market_cap,
         strength=strength,
-        institution_count=1,
-        trend_concepts='创新药、仿制药一致性评价',
-        big_institution_count=1,
-        linkage='—',
         limit_up=limit_up,
     )
 
 
-def test_build_card_uses_required_title_and_colored_values() -> None:
+def test_build_card_uses_required_title_and_core_fields() -> None:
     inflow = [
         _row('002437', '誉衡药业', 5.18, 1.083e9, 7.75e9),
         _row('000993', '闽东电力', 4.07, 5.50e8, 6.40e9),
@@ -69,36 +63,93 @@ def test_build_card_uses_required_title_and_colored_values() -> None:
     assert "强度 <font color='green'>-9.21%</font>" in content
     assert '#1 誉衡药业（002437）' in content
     assert '#1 慈文传媒（002343）' in content
-    assert '走势概念 创新药、仿制药一致性评价' in content
-    assert '大机构 1｜联动：—' in content
+    assert '行业' not in content
+    assert '走势概念' not in content
+    assert '机构' not in content
+    assert '联动' not in content
 
 
-def test_normalize_row_parses_iwencai_fields_and_strength() -> None:
+def test_normalize_row_parses_eastmoney_fields_and_strength() -> None:
     raw = {
-        '股票代码': '002437.SZ',
-        '股票简称': '誉衡药业',
-        '最新价': '3.45',
-        '涨跌幅[20261016]': 5.18,
-        '大单净额': '1.083E9',
-        '总市值[20261016]': 7750000000.0,
-        '机构股东家数[20260630]': 1.0,
-        '行业同顺行业': ['医药生物'],
-        '所属概念': ['创新药', '仿制药一致性评价'],
-        '走势概念': ['创新药', '仿制药一致性评价'],
+        'f12': '002437.SZ',
+        'f14': '誉衡药业',
+        'f2': '3.45',
+        'f3': 5.18,
+        'f20': '7,750,000,000.00',
+        'f21': '6,400,000,000.00',
+        'f72': '1.083E9',
     }
     rows = StockDDENotifyService._normalize_rows([raw], [('002437', '誉衡药业')])
 
     assert len(rows) == 1
     row = rows[0]
     assert row.code == '002437'
-    assert row.industry == '医药生物'
-    assert row.concepts == '创新药、仿制药一致性评价'
-    assert row.trend_concepts == '创新药、仿制药一致性评价'
-    assert row.institution_count == 1
-    assert row.big_institution_count is None
-    assert row.linkage == '—'
+    assert row.name == '誉衡药业'
+    assert row.price == 3.45
+    assert row.pct_change == 5.18
+    assert row.large_net == 1.083e9
+    assert row.market_cap == 7750000000.0
     assert row.limit_up is False
     assert row.strength == 13.974193548387096
+
+
+def test_to_secid_by_market() -> None:
+    assert StockDDENotifyService._to_secid('001246') == '0.001246'
+    assert StockDDENotifyService._to_secid('600661') == '1.600661'
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_rows_parses_eastmoney_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {
+                'data': {
+                    'diff': [
+                        {
+                            'f12': '001246.SZ',
+                            'f14': '泓淋电力',
+                            'f2': 31.2,
+                            'f3': -0.5,
+                            'f20': 45656989489.016,
+                            'f21': 4910162400.0,
+                            'f72': -446720.91,
+                        }
+                    ]
+                }
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: Any = None, headers: Any = None) -> None:
+            captured['timeout'] = timeout
+            captured['headers'] = headers
+
+        async def __aenter__(self) -> 'FakeAsyncClient':
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def get(self, url: str, params: dict[str, str] | None = None) -> FakeResponse:
+            captured['url'] = url
+            captured['params'] = params
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, 'AsyncClient', FakeAsyncClient)
+    rows = await StockDDENotifyService._fetch_market_rows(['001246', '600661'])
+
+    assert len(rows) == 1
+    assert rows[0]['f12'] == '001246.SZ'
+    assert captured['params']['secids'] == '0.001246,1.600661'
+    assert captured['params']['pz'] == '2'
+    assert captured['params']['fields'] == 'f12,f14,f2,f3,f20,f21,f72'
 
 
 def test_limit_up_detection_by_board_and_name() -> None:

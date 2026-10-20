@@ -71,8 +71,8 @@ async def run_trades(
     request: Request,
     run_id: Annotated[str, Path()],
     db: Annotated[AsyncSession, DBSessionDependency()],
-    trade_page_num: Annotated[int, Query(ge=1)] = 1,
-    trade_page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+    trade_page_num: Annotated[int, Query(alias='tradePageNum', ge=1)] = 1,
+    trade_page_size: Annotated[int, Query(alias='tradePageSize', ge=1, le=200)] = 50,
 ) -> Response:
     return ResponseUtil.success(
         data=await StockStrategyService.run_trades(db, run_id, trade_page_num, trade_page_size)
